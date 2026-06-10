@@ -20,6 +20,7 @@ find_package(nlohmann_json REQUIRED)
 
 set(PROTOCOL_SOURCES
     logos_protocol.h
+    logos_module_impl.h
     logos_protocol.cpp
     logos_types.cpp
     logos_types.h
@@ -159,6 +160,7 @@ install(FILES
 # (etc.) keep resolving unchanged through propagated include dirs.
 install(FILES
     logos_protocol.h
+    logos_module_impl.h
     logos_types.h
     logos_api_client.h
     logos_api_consumer.h
