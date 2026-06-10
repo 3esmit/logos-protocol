@@ -5,6 +5,7 @@
 #include <QVariant>
 #include <QVariantList>
 #include <QJsonArray>
+#include <QtPlugin>
 #include <nlohmann/json.hpp>
 #include <functional>
 #include <string>
@@ -65,5 +66,23 @@ protected:
     QJsonArray getMethodsStdBridge();
     void setEventListenerStdBridge(EventCallback callback);
 };
+
+// ---------------------------------------------------------------------------
+// LogosProviderPlugin — Qt interface for plugin loading (framework internal)
+//
+// New-API plugins implement this so hosts and tools can detect them via
+// qobject_cast<LogosProviderPlugin*>() and use createProviderObject().
+// Lives here (beside the abstract LogosProviderObject) so plugin-loading
+// tools need only the protocol headers; the developer-facing base classes
+// remain in logos-qt-sdk.
+// ---------------------------------------------------------------------------
+class LogosProviderPlugin {
+public:
+    virtual ~LogosProviderPlugin() = default;
+    virtual LogosProviderObject* createProviderObject() = 0;
+};
+
+#define LogosProviderPlugin_iid "org.logos.LogosProviderPlugin"
+Q_DECLARE_INTERFACE(LogosProviderPlugin, LogosProviderPlugin_iid)
 
 #endif // LOGOS_PROVIDER_INTERFACE_H
