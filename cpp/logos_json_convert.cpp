@@ -82,6 +82,17 @@ nlohmann::json qvariantToNlohmann(const QVariant& v)
         catch (...) {}
     }
 
+    // Integers stay integers: QJsonValue::fromVariant degrades every numeric
+    // to double, which a strict consumer on the other side of the C ABI
+    // (e.g. a generated dispatch reading an int param) must not see as 5.0.
+    switch (v.userType()) {
+    case QMetaType::Int:       return v.toInt();
+    case QMetaType::UInt:      return v.toUInt();
+    case QMetaType::LongLong:  return static_cast<int64_t>(v.toLongLong());
+    case QMetaType::ULongLong: return static_cast<uint64_t>(v.toULongLong());
+    default: break;
+    }
+
     QJsonValue jv = QJsonValue::fromVariant(v);
     if (jv.isString())  return jv.toString().toStdString();
     if (jv.isBool())    return jv.toBool();
