@@ -1,0 +1,41 @@
+name: CI
+
+# pull_request is unfiltered: stacked PRs (based on other feature branches)
+# must run CI too.
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # DeterminateSystems' installer: reliable on the macOS runners, where
+      # cachix/install-nix-action trips over pre-existing nix build users
+      # (eDSRecordAlreadyExists).
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - uses: cachix/cachix-action@v15
+        # The cache is an optimization: don't let a failed push in the
+        # action's post step fail a job whose tests all passed.
+        continue-on-error: true
+        with:
+          name: logos-co
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+
+      - name: Build tests
+        run: nix build '.#tests'
+
+      - name: Run protocol tests
+        run: ./result/bin/protocol_tests
+        env:
+          QT_QPA_PLATFORM: offscreen

@@ -105,11 +105,25 @@ bool LogosAPIConsumer::reconnect()
 QVariant LogosAPIConsumer::invokeRemoteMethod(const QString& authToken, const QString& objectName, const QString& methodName,
                                    const QVariantList& args, Timeout timeout)
 {
+    return invokeRemoteMethod(authToken, objectName, methodName, args, timeout, nullptr);
+}
+
+QVariant LogosAPIConsumer::invokeRemoteMethod(const QString& authToken, const QString& objectName, const QString& methodName,
+                                   const QVariantList& args, Timeout timeout, logos::CallError* err)
+{
+    if (err) err->clear();
     qDebug() << "LogosAPIConsumer: Calling invokeRemoteMethod:" << objectName << methodName << "args_count:" << args.size() << "timeout:" << timeout.ms;
 
     LogosObject* plugin = m_transport->requestObject(objectName, timeout.ms);
     if (!plugin) {
         qWarning() << "LogosAPIConsumer: Failed to acquire plugin/replica for object:" << objectName;
+        if (err) {
+            err->code = "object_unavailable";
+            err->message = "failed to acquire remote object '"
+                           + objectName.toStdString()
+                           + "' (module not loaded, not published, or transport failure)";
+            err->origin = objectName.toStdString();
+        }
         return QVariant();
     }
 

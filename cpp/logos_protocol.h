@@ -65,6 +65,7 @@ extern "C" {
 #define LP_ERR_INVALID_ARG (-1)
 #define LP_ERR_UNSUPPORTED (-2) /* provider surface: exercised in a later phase */
 #define LP_ERR_INTERNAL (-3)
+#define LP_ERR_UNAVAILABLE (-4) /* target module/object could not be acquired */
 
 /* ---------------------------------------------------------------------------
  * Version

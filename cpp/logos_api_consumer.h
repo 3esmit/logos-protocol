@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 
+#include "logos_call_error.h"
 #include "logos_mode.h"
 #include "logos_transport_config.h"
 
@@ -78,6 +79,19 @@ public:
 
     QVariant invokeRemoteMethod(const QString& authToken, const QString& objectName, const QString& methodName,
                              const QVariantList& args = QVariantList(), Timeout timeout = Timeout());
+
+    /**
+     * @brief invokeRemoteMethod with an explicit error out-channel.
+     *
+     * Fills *err with the canonical {code, message, origin} call error when
+     * the failure is detectable on this side (today: "object_unavailable"
+     * when the target object/replica cannot be acquired). On success *err is
+     * cleared. Failures the transport cannot yet distinguish from a void
+     * result (per-dispatch errors) leave *err clear — the struct is the
+     * extension point for surfacing transport-level statuses later.
+     */
+    QVariant invokeRemoteMethod(const QString& authToken, const QString& objectName, const QString& methodName,
+                             const QVariantList& args, Timeout timeout, logos::CallError* err);
 
     using AsyncResultCallback = std::function<void(QVariant)>;
 

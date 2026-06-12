@@ -112,3 +112,25 @@ TEST(JsonConvertBytes, OrdinaryObjectsAreNotMistakenForBytes)
     QVariant v3 = nlohmannToQVariant(plain);
     EXPECT_NE(v3.userType(), QMetaType::QByteArray);
 }
+
+TEST(JsonConvertBytes, IntegersStayIntegersNotDoubles)
+{
+    // QJsonValue::fromVariant degrades every numeric to double; the canonical
+    // C-ABI converter must not — a strict consumer (e.g. a generated dispatch
+    // reading an int param) rejects 5.0 where it expects 5.
+    nlohmann::json a = qvariantToNlohmann(QVariant(static_cast<qulonglong>(5)));
+    EXPECT_TRUE(a.is_number_integer() || a.is_number_unsigned());
+    EXPECT_EQ(a.get<int64_t>(), 5);
+
+    nlohmann::json b = qvariantToNlohmann(QVariant(static_cast<qlonglong>(-7)));
+    EXPECT_TRUE(b.is_number_integer());
+    EXPECT_EQ(b.get<int64_t>(), -7);
+
+    nlohmann::json c = qvariantToNlohmann(QVariant(42));
+    EXPECT_TRUE(c.is_number_integer());
+    EXPECT_EQ(c.get<int64_t>(), 42);
+
+    // Doubles stay doubles.
+    nlohmann::json d = qvariantToNlohmann(QVariant(3.5));
+    EXPECT_TRUE(d.is_number_float());
+}

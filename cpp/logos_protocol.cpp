@@ -242,8 +242,16 @@ int lp_invoke(lp_client* client,
         return LP_ERR_INVALID_ARG;
     }
 
+    logos::CallError callErr;
     const QVariant result = client->client->invokeRemoteMethod(
-        client->target, QString::fromUtf8(method), args, lpTimeout(timeout_ms));
+        client->target, QString::fromUtf8(method), args, lpTimeout(timeout_ms), &callErr);
+
+    if (!callErr.ok()) {
+        if (out_error_json)
+            *out_error_json = lpStrdup(makeErrorJson(
+                callErr.code.c_str(), callErr.message, callErr.origin));
+        return LP_ERR_UNAVAILABLE;
+    }
 
     if (out_result_json)
         *out_result_json = lpStrdup(logos::qvariantToNlohmann(result).dump());

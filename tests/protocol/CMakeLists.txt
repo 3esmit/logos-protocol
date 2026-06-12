@@ -6,6 +6,7 @@ add_executable(protocol_tests
     test_protocol_version.cpp
     test_json_convert_bytes.cpp
     test_lp_client.cpp
+    test_call_error.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp
