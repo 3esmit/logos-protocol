@@ -94,11 +94,11 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
     if (token.isEmpty() && objectName != "capability_module" && m_capability_consumer) {
         qDebug() << "LogosAPIClient: calling requestModule for" << objectName;
         QString capabilityToken = getToken("capability_module");
-        QVariant result = m_capability_consumer->invokeRemoteMethod(
-            capabilityToken, "capability_module", "requestModule",
-            QVariantList() << m_origin_module << objectName, timeout);
-        qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":" << result.toString();
-        token = result.toString();
+        token = QString::fromStdString(
+            m_capability_consumer->requestModule(capabilityToken.toStdString(),
+                                                 m_origin_module.toStdString(),
+                                                 objectName.toStdString()));
+        qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":" << token;
     }
 
     return m_consumer->invokeRemoteMethod(token, objectName, methodName, args, timeout);
