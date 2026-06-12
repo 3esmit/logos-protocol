@@ -1,0 +1,212 @@
+#include "module_proxy.h"
+#include "logos_provider_interface.h"
+#include "token_manager.h"
+#include <QDebug>
+#include <QByteArray>
+#include <QJsonObject>
+#include <QJsonValue>
+#include <algorithm>
+
+ModuleProxy::ModuleProxy(LogosProviderObject* provider, QObject* parent)
+    : QObject(parent)
+    , m_provider(provider)
+{
+    if (m_provider) {
+        m_provider->setEventListener([this](const QString& eventName, const QVariantList& data) {
+            qDebug() << "[LogosProviderObject] ModuleProxy: forwarding event" << eventName << "as Qt signal";
+            // Events may be fired from any thread (e.g. a module's worker/FFI
+            // thread), but this object is the QtRemoteObjects source and must be
+            // driven from its own thread. Emitting directly from a foreign
+            // thread runs QtRO's source serialization there, racing the source
+            // socket against a reply being sent from the source thread, which
+            // can silently drop the reply. AutoConnection keeps same-thread
+            // callers synchronous (the common case) and only queues the
+            // emission when it arrives from another thread, so events and
+            // replies stay serialized on the thread QtRO expects to own the
+            // source. Passing `this` as the context also cancels a queued
+            // emission if this object is destroyed first.
+            QMetaObject::invokeMethod(this, [this, eventName, data]() {
+                emit eventResponse(eventName, data);
+            }, Qt::AutoConnection);
+        });
+        qDebug() << "[LogosProviderObject] ModuleProxy: created, wrapping LogosProviderObject"
+                 << m_provider->providerName();
+    }
+}
+
+ModuleProxy::~ModuleProxy()
+{
+    qDebug() << "ModuleProxy: destroyed";
+}
+
+bool ModuleProxy::saveToken(const QString& from_module_name, const QString& token)
+{
+    if (from_module_name.isEmpty()) {
+        qWarning() << "ModuleProxy: Cannot save token with empty module name";
+        return false;
+    }
+    if (token.isEmpty()) {
+        qWarning() << "ModuleProxy: Cannot save empty token for module:" << from_module_name;
+        return false;
+    }
+
+    m_tokens[from_module_name] = token;
+    qDebug() << "ModuleProxy: Token saved for module:" << from_module_name;
+    return true;
+}
+
+QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args)
+{
+    if (!m_provider) {
+        qWarning() << "ModuleProxy: Cannot call method on null provider:" << methodName;
+        return QVariant();
+    }
+
+    if (methodName.isEmpty()) {
+        qWarning() << "ModuleProxy: Method name cannot be empty";
+        return QVariant();
+    }
+
+    if (methodName == "getPluginMethods" && args.isEmpty()) {
+        return QVariant(getPluginMethods());
+    }
+
+    if (methodName == "getPluginEvents" && args.isEmpty()) {
+        return QVariant(getPluginEvents());
+    }
+
+    if (methodName == "getPluginInterface" && args.isEmpty()) {
+        return QVariant(getPluginInterface());
+    }
+    // NOTE: the three getPlugin* introspection calls above intentionally stay
+    // ungated. They expose only the method/event signatures (no business logic
+    // or state) and are needed before any token exists — a caller discovers a
+    // module's interface as part of the connection handshake, ahead of the
+    // capability_module token exchange. Everything past this point is a real
+    // business-method dispatch and MUST be authorized.
+
+    if (!isAuthorized(authToken)) {
+        qWarning() << "ModuleProxy: rejecting unauthorized call to" << methodName
+                   << "- auth token not recognized";
+        return QVariant();
+    }
+
+    qDebug() << "ModuleProxy: callRemoteMethod" << methodName << "args:" << args;
+    return m_provider->callMethod(methodName, args);
+}
+
+namespace {
+// note: this is to ensure comparison is constant time to prevent timing attacks
+// Length-independent constant-time comparison of two tokens. Returns true only
+// when both byte sequences are identical. We compare over the longer of the two
+// lengths (folding any length difference into the result) so the running time
+// does not reveal a correct prefix or the secret's length.
+bool constantTimeEquals(const QString& a, const QString& b)
+{
+    const QByteArray ba = a.toUtf8();
+    const QByteArray bb = b.toUtf8();
+    const int n = std::max(ba.size(), bb.size());
+    // A different length is a mismatch, but keep scanning to stay constant-time.
+    int diff = ba.size() ^ bb.size();
+    for (int i = 0; i < n; ++i) {
+        const unsigned char ca = i < ba.size() ? static_cast<unsigned char>(ba[i]) : 0;
+        const unsigned char cb = i < bb.size() ? static_cast<unsigned char>(bb[i]) : 0;
+        diff |= (ca ^ cb);
+    }
+    return diff == 0;
+}
+} // namespace
+
+bool ModuleProxy::informModuleToken(const QString& authToken, const QString& moduleName, const QString& token)
+{
+    if (!m_provider) {
+        qWarning() << "ModuleProxy: Cannot inform token on null provider";
+        return false;
+    }
+
+    const QString coreToken = TokenManager::instance().getToken(QStringLiteral("core"));
+    const QString capToken  = TokenManager::instance().getToken(QStringLiteral("capability_module"));
+    const bool callerIsTrusted =
+        (!coreToken.isEmpty() && constantTimeEquals(authToken, coreToken)) ||
+        (!capToken.isEmpty()  && constantTimeEquals(authToken, capToken));
+    if (authToken.isEmpty() || !callerIsTrusted) {
+        qWarning() << "ModuleProxy: rejecting informModuleToken for" << moduleName
+                   << "- caller is not the trusted core/capability_module channel";
+        return false;
+    }
+
+    if (moduleName.isEmpty()) {
+        qWarning() << "ModuleProxy: Cannot inform token with empty module name";
+        return false;
+    }
+    if (token.isEmpty()) {
+        qWarning() << "ModuleProxy: Cannot inform empty token for module:" << moduleName;
+        return false;
+    }
+
+    return m_provider->informModuleToken(moduleName, token);
+}
+
+bool ModuleProxy::isAuthorized(const QString& authToken) const
+{
+    // Fail closed: an empty token is never valid, even if some empty value
+    // somehow ended up in a token store.
+    if (authToken.isEmpty()) {
+        return false;
+    }
+
+    // A token is valid only if THIS module actually issued it to some caller.
+    // Two stores hold issued tokens:
+    //   * m_tokens          — legacy per-proxy store (LogosAPIProvider::saveToken)
+    //   * TokenManager      — the capability-flow store that informModuleToken
+    //                         writes when capability_module mints a token for a
+    //                         (caller, target) pair.
+    // We scan every issued token with a constant-time compare and never early
+    // out, so neither a match position nor the number of issued tokens leaks
+    // through timing.
+    bool authorized = false;
+    for (auto it = m_tokens.constBegin(); it != m_tokens.constEnd(); ++it) {
+        authorized |= constantTimeEquals(authToken, it.value());
+    }
+    for (const QString& key : TokenManager::instance().getTokenKeys()) {
+        authorized |= constantTimeEquals(authToken, TokenManager::instance().getToken(key));
+    }
+    return authorized;
+}
+
+namespace {
+// getMethods() returns the module's full interface — both methods and events,
+// each tagged with a "type" ("method"/"event"). Split it back out. An entry
+// with no "type" counts as a method, so modules built against the pre-events
+// SDK (whose getMethods() contains no events) report zero events, not a crash.
+QJsonArray filterInterface(const QJsonArray& interface, bool keepEvents)
+{
+    QJsonArray out;
+    for (const QJsonValue& v : interface) {
+        const bool isEvent =
+            v.toObject().value(QStringLiteral("type")).toString() == QStringLiteral("event");
+        if (isEvent == keepEvents) out.append(v);
+    }
+    return out;
+}
+} // namespace
+
+QJsonArray ModuleProxy::getPluginInterface()
+{
+    if (!m_provider) return QJsonArray();
+
+    qDebug() << "[LogosProviderObject] ModuleProxy: calling LogosProviderObject::getMethods()";
+    return m_provider->getMethods();
+}
+
+QJsonArray ModuleProxy::getPluginMethods()
+{
+    return filterInterface(getPluginInterface(), /*keepEvents=*/false);
+}
+
+QJsonArray ModuleProxy::getPluginEvents()
+{
+    return filterInterface(getPluginInterface(), /*keepEvents=*/true);
+}
+
+#include "moc_module_proxy.cpp"
