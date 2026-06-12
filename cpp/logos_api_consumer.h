@@ -9,6 +9,7 @@
 #include <QMap>
 #include <functional>
 #include <memory>
+#include <string>
 
 #include "logos_call_error.h"
 #include "logos_mode.h"
@@ -120,6 +121,7 @@ public:
 public slots:
     bool informModuleToken(const QString& authToken, const QString& moduleName, const QString& token);
     bool informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token);
+    std::string requestModule(const std::string& authToken, const std::string& originModule, const std::string& targetModule);
 
 private:
     std::unique_ptr<LogosTransportConnection> m_transport;
