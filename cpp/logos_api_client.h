@@ -9,6 +9,7 @@
 #include <functional>
 #include <string>
 
+#include "logos_call_error.h"
 #include "logos_mode.h"
 #include "logos_transport_config.h"
 #include <nlohmann/json.hpp>
@@ -70,10 +71,23 @@ public:
     QString registryUrl() const;
     bool reconnect();
 
-    QVariant invokeRemoteMethod(const QString& objectName, const QString& methodName, 
+    QVariant invokeRemoteMethod(const QString& objectName, const QString& methodName,
                              const QVariantList& args = QVariantList(), Timeout timeout = Timeout());
 
-    QVariant invokeRemoteMethod(const QString& objectName, const QString& methodName, 
+    /**
+     * @brief invokeRemoteMethod with an explicit error out-channel.
+     *
+     * Fills *err with the canonical {code, message, origin} call error when
+     * the failure is detectable (today: "object_unavailable" when the target
+     * object cannot be acquired); cleared on success. Generated typed client
+     * wrappers call this overload and throw logos::LogosCallError so callers
+     * can distinguish a failed call from a legitimately default-valued
+     * result.
+     */
+    QVariant invokeRemoteMethod(const QString& objectName, const QString& methodName,
+                             const QVariantList& args, Timeout timeout, logos::CallError* err);
+
+    QVariant invokeRemoteMethod(const QString& objectName, const QString& methodName,
                              const QVariant& arg, Timeout timeout = Timeout());
 
     QVariant invokeRemoteMethod(const QString& objectName, const QString& methodName, 

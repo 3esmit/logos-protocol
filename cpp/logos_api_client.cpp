@@ -83,6 +83,13 @@ bool LogosAPIClient::reconnect()
 QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QString& methodName,
                                    const QVariantList& args, Timeout timeout)
 {
+    return invokeRemoteMethod(objectName, methodName, args, timeout, nullptr);
+}
+
+QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QString& methodName,
+                                   const QVariantList& args, Timeout timeout, logos::CallError* err)
+{
+    if (err) err->clear();
     // Marshal the whole operation (capability/token fetch + the call) onto the
     // owner thread so a worker thread (e.g. an HTTP handler) can call other
     // modules. Same-thread callers run directly. See logos_thread_marshal.h.
@@ -101,7 +108,7 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
         token = result.toString();
     }
 
-    return m_consumer->invokeRemoteMethod(token, objectName, methodName, args, timeout);
+    return m_consumer->invokeRemoteMethod(token, objectName, methodName, args, timeout, err);
     });
 }
 
