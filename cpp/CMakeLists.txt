@@ -133,6 +133,46 @@ install(TARGETS logos_protocol
     INCLUDES DESTINATION include
 )
 
+# Shared variant of the same sources, exporting the language-neutral lp_*
+# C ABI (extern "C", default visibility) as a loadable library. This exists
+# purely for OUT-OF-PLUGIN callers that bind lp_* at runtime via dlopen/FFI
+# (e.g. logos-js-sdk's koffi.load, logos-rust-sdk's callerBuildSupport) —
+# the role liblogos_module_client previously filled. In-plugin code keeps
+# linking the STATIC `logos_protocol` archive through the EXPORT set below,
+# so this target is intentionally NOT exported and NOT installed into the
+# CMake package; `find_package(logos-protocol)` is unaffected.
+add_library(logos_protocol_shared SHARED ${PROTOCOL_SOURCES})
+
+target_link_libraries(logos_protocol_shared PUBLIC
+    Qt${QT_VERSION_MAJOR}::Core
+    Qt${QT_VERSION_MAJOR}::RemoteObjects
+    Boost::headers
+    Boost::system
+    OpenSSL::SSL
+    OpenSSL::Crypto
+    nlohmann_json::nlohmann_json
+)
+
+target_include_directories(logos_protocol_shared PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_local>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_remote>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/mock>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/plain>
+)
+
+# Same basename as the archive (liblogos_protocol.{so,dylib}); the LIBRARY
+# install below lands it in $out/lib next to liblogos_protocol.a.
+set_target_properties(logos_protocol_shared PROPERTIES
+    OUTPUT_NAME logos_protocol
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+)
+
+install(TARGETS logos_protocol_shared
+    LIBRARY DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+
 install(EXPORT logos-protocolTargets
     FILE logos-protocolTargets.cmake
     NAMESPACE logos-protocol::
