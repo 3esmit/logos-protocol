@@ -21,6 +21,10 @@ add_executable(protocol_tests
     test_cbor_codec.cpp
     # Per-module concurrent dispatch (concurrency:"multi") over the plain transport.
     test_concurrent_dispatch.cpp
+    # Event delivery + reentrant-release teardown over the qt_remote (LocalSocket)
+    # transport — the path a deferred "multi" completion event takes, and where the
+    # refresh_balances onClientRead re-entrancy crash lived.
+    test_remote_transport_events.cpp
     # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
     # in-process Qt-event-loop deadlock between consumer + provider under
     # nix's test sandbox; exercised cross-process by the integration matrix).

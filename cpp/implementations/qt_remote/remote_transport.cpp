@@ -72,7 +72,22 @@ public:
                     if (m_asyncCompletionCbs.contains(id)) {  // fire an async waiter
                         auto cb = m_asyncCompletionCbs.take(id);
                         m_completions.remove(id);
-                        if (cb) cb(result);
+                        // Deliver on the NEXT event-loop turn, never inline. This
+                        // runs from RemoteEventHelper::onEventResponse, which —
+                        // cross-process — is on QtRO's onClientRead read stack. The
+                        // user callback (LogosAPIConsumer's async lambda → the
+                        // module's completion handler) routinely emits a module
+                        // event (host ModuleProxy → QtRO source serialization) and
+                        // then release()s this object. Doing either while
+                        // onClientRead is still unwinding re-enters QtRO and
+                        // corrupts the node — the refresh_balances SIGSEGV
+                        // (KERN_INVALID_ADDRESS in onClientRead). Deferring runs the
+                        // user code after the read fully unwinds. m_helper is the
+                        // context so the callback is dropped if we're torn down
+                        // first (mirrors the QPointer guard in invokeRemoteMethodAsync).
+                        if (cb)
+                            QTimer::singleShot(0, m_helper,
+                                [cb = std::move(cb), result]() { cb(result); });
                     }
                 });
         }
@@ -80,7 +95,15 @@ public:
 
     ~RemoteLogosObject() override {
         qDebug() << "[LogosObject] Destroying RemoteLogosObject" << reinterpret_cast<quintptr>(m_replica);
-        delete m_helper;
+        // release() normally clears m_helper first (deferred). If we get here on a
+        // direct delete, defer the helper too: a direct delete can still be reached
+        // from within the helper's own slot dispatch. See disconnectEvents().
+        if (m_helper) {
+            if (m_replica)
+                QObject::disconnect(m_replica, nullptr, m_helper, nullptr);
+            m_helper->deleteLater();
+            m_helper = nullptr;
+        }
     }
 
     QVariant callMethod(const QString& authToken,
@@ -255,7 +278,26 @@ public:
 
     void disconnectEvents() override
     {
-        delete m_helper;
+        if (!m_helper) return;
+        // Defer the helper's destruction instead of deleting it inline.
+        //
+        // release()/disconnectEvents() can be reached *synchronously from inside
+        // the helper's own onEventResponse() slot*: a deferred ("multi") call's
+        // result is delivered as a completion event that fires onEventResponse,
+        // whose callback (LogosAPIConsumer::invokeRemoteMethodAsync) runs the
+        // user callback and then calls plugin->release(). With the qt_remote
+        // transport the event arrives cross-process, so onEventResponse runs on
+        // the QtRO read stack (QRemoteObjectNodePrivate::onClientRead) while the
+        // replica is still emitting. Deleting the helper (the signal receiver)
+        // here — and the replica (the sender) in release() — corrupts the
+        // connection list Qt is still iterating, a use-after-free that crashes in
+        // QMetaObjectPrivate::signal / onClientRead (the refresh_balances SIGSEGV).
+        //
+        // Stop further dispatch now by disconnecting, then let the event loop
+        // delete the helper once the current emission has fully unwound.
+        if (m_replica)
+            QObject::disconnect(m_replica, nullptr, m_helper, nullptr);
+        m_helper->deleteLater();
         m_helper = nullptr;
     }
 
@@ -278,9 +320,17 @@ public:
 
     void release() override
     {
-        disconnectEvents();
-        delete m_replica;
-        m_replica = nullptr;
+        disconnectEvents();              // defers the helper (signal receiver)
+        // The replica is the QtRO signal *sender* whose eventResponse() may be the
+        // very emission that re-entered release() (a deferred completion event).
+        // Deleting the sender mid-emit corrupts QtRO's read path
+        // (QRemoteObjectNodePrivate::onClientRead) — defer it too. deleteLater also
+        // keeps any QVariant return storage backed by the replica alive until the
+        // consumer callback (which runs before this release) has consumed it.
+        if (m_replica) {
+            m_replica->deleteLater();
+            m_replica = nullptr;
+        }
         delete this;
     }
 

@@ -19,15 +19,23 @@ ModuleProxy::ModuleProxy(LogosProviderObject* provider, QObject* parent)
             // driven from its own thread. Emitting directly from a foreign
             // thread runs QtRO's source serialization there, racing the source
             // socket against a reply being sent from the source thread, which
-            // can silently drop the reply. AutoConnection keeps same-thread
-            // callers synchronous (the common case) and only queues the
-            // emission when it arrives from another thread, so events and
-            // replies stay serialized on the thread QtRO expects to own the
-            // source. Passing `this` as the context also cancels a queued
-            // emission if this object is destroyed first.
+            // can silently drop the reply.
+            //
+            // We *always* queue the emission to this object's own thread, never
+            // emit inline — even for a same-thread caller. A module that emits an
+            // event from inside an async-call-completion callback (e.g. a
+            // gather/fan-out completion firing `balances_updated` from within the
+            // `__logos_call_complete__` reply dispatch) is on the source thread,
+            // so an AutoConnection would run QtRO's source serialization for the
+            // event *re-entrantly*, while a reply is still being marshalled on the
+            // same stack — corrupting the source and crashing (SIGSEGV). A queued
+            // connection defers the emit to the next event-loop turn, after the
+            // reply has been sent, so events and replies stay serialized on the
+            // thread QtRO owns. Passing `this` as the context also cancels a
+            // queued emission if this object is destroyed first.
             QMetaObject::invokeMethod(this, [this, eventName, data]() {
                 emit eventResponse(eventName, data);
-            }, Qt::AutoConnection);
+            }, Qt::QueuedConnection);
         });
         qDebug() << "[LogosProviderObject] ModuleProxy: created, wrapping LogosProviderObject"
                  << m_provider->providerName();
