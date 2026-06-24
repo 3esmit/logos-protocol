@@ -123,14 +123,17 @@ QVariant nlohmannToQVariant(const nlohmann::json& j)
     if (isTaggedBytes(j))
         return QVariant(taggedJsonToByteArray(j));
     if (j.is_object()) {
-        QJsonDocument doc = QJsonDocument::fromJson(
-            QByteArray::fromStdString(j.dump()));
-        return QVariant::fromValue(doc.object());
+        QVariantMap map;
+        for (auto it = j.begin(); it != j.end(); ++it)
+            map.insert(QString::fromStdString(it.key()), nlohmannToQVariant(it.value()));
+        return QVariant(map);
     }
     if (j.is_array()) {
-        QJsonDocument doc = QJsonDocument::fromJson(
-            QByteArray::fromStdString(j.dump()));
-        return QVariant::fromValue(doc.array());
+        QVariantList list;
+        list.reserve(static_cast<int>(j.size()));
+        for (const auto& elem : j)
+            list.append(nlohmannToQVariant(elem));
+        return QVariant(list);
     }
     return QVariant();
 }
@@ -155,11 +158,7 @@ QVariantList nlohmannArgsToQVariantList(const nlohmann::json& args)
         else if (isTaggedBytes(arg))
             result.append(QVariant(taggedJsonToByteArray(arg)));
         else if (arg.is_object() || arg.is_array()) {
-            QJsonDocument doc = QJsonDocument::fromJson(
-                QByteArray::fromStdString(arg.dump()));
-            result.append(arg.is_object()
-                ? QVariant::fromValue(doc.object())
-                : QVariant::fromValue(doc.array()));
+            result.append(nlohmannToQVariant(arg));
         } else {
             result.append(QVariant());
         }

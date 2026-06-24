@@ -5,8 +5,10 @@
 
 #include <QByteArray>
 #include <QMetaType>
+#include <QStringList>
 #include <QVariant>
 #include <QVariantList>
+#include <QVariantMap>
 
 // The canonical C-ABI bytes encoding: QByteArray ⇄ {"_bytes":"<base64url>"}
 // (single-key object, unpadded base64url — same as the plain wire's
@@ -133,4 +135,77 @@ TEST(JsonConvertBytes, IntegersStayIntegersNotDoubles)
     // Doubles stay doubles.
     nlohmann::json d = qvariantToNlohmann(QVariant(3.5));
     EXPECT_TRUE(d.is_number_float());
+}
+
+TEST(JsonConvertArrays, StringArrayRoundTripsToQStringList)
+{
+    nlohmann::json j = nlohmann::json::array({"a", "b", "c"});
+    QVariant v = nlohmannToQVariant(j);
+
+    const QStringList list = v.toStringList();
+    ASSERT_EQ(list.size(), 3);
+    EXPECT_EQ(list.at(0), "a");
+    EXPECT_EQ(list.at(1), "b");
+    EXPECT_EQ(list.at(2), "c");
+}
+
+TEST(JsonConvertArrays, MixedArrayRoundTripsToQVariantList)
+{
+    nlohmann::json j = nlohmann::json::array({"a", 42, true, nullptr});
+    QVariant v = nlohmannToQVariant(j);
+
+    const QVariantList list = v.toList();
+    ASSERT_EQ(list.size(), 4);
+    EXPECT_EQ(list.at(0).toString(), "a");
+    EXPECT_EQ(list.at(1).toLongLong(), 42);
+    EXPECT_EQ(list.at(2).toBool(), true);
+    EXPECT_FALSE(list.at(3).isValid());
+}
+
+TEST(JsonConvertArrays, ObjectRoundTripsToQVariantMap)
+{
+    nlohmann::json j = {{"name", "wallet_module"}, {"version", 1}};
+    QVariant v = nlohmannToQVariant(j);
+
+    const QVariantMap map = v.toMap();
+    EXPECT_EQ(map.value("name").toString(), "wallet_module");
+    EXPECT_EQ(map.value("version").toLongLong(), 1);
+}
+
+TEST(JsonConvertArrays, NestedArrayInsideObjectIsAlsoConverted)
+{
+    nlohmann::json j = {{"clients", nlohmann::json::array({"u1", "u2"})}};
+    QVariant v = nlohmannToQVariant(j);
+
+    const QVariantMap map = v.toMap();
+    const QStringList inner = map.value("clients").toStringList();
+    ASSERT_EQ(inner.size(), 2);
+    EXPECT_EQ(inner.at(0), "u1");
+    EXPECT_EQ(inner.at(1), "u2");
+}
+
+TEST(JsonConvertArgs, NestedStringArrayArgRoundTripsToQStringList)
+{
+    nlohmann::json args = nlohmann::json::array({nlohmann::json::array({"p1", "p2", "p3"})});
+    const QVariantList qArgs = nlohmannArgsToQVariantList(args);
+
+    ASSERT_EQ(qArgs.size(), 1);
+    const QStringList inner = qArgs.at(0).toStringList();
+    ASSERT_EQ(inner.size(), 3);
+    EXPECT_EQ(inner.at(0), "p1");
+    EXPECT_EQ(inner.at(1), "p2");
+    EXPECT_EQ(inner.at(2), "p3");
+}
+
+TEST(JsonConvertArgs, NestedObjectArgRoundTripsToQVariantMap)
+{
+    nlohmann::json args = nlohmann::json::array({
+        {{"port", 30303}, {"name", "node-a"}}
+    });
+    const QVariantList qArgs = nlohmannArgsToQVariantList(args);
+
+    ASSERT_EQ(qArgs.size(), 1);
+    const QVariantMap inner = qArgs.at(0).toMap();
+    EXPECT_EQ(inner.value("port").toLongLong(), 30303);
+    EXPECT_EQ(inner.value("name").toString(), "node-a");
 }
