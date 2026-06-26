@@ -106,6 +106,8 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
                                                  m_origin_module.toStdString(),
                                                  objectName.toStdString()));
         qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":" << token;
+        // Cache the minted token so subsequent calls skip the handshake — closes the token-rotation race where overlapping requestModule calls mint fresh tokens that overwrite each other at the target (e.g. QtRO's sync wait reentering via a nested event loop).
+        if (!token.isEmpty()) m_token_manager->saveToken(objectName, token);
     }
 
     return m_consumer->invokeRemoteMethod(token, objectName, methodName, args, timeout, err);
@@ -208,6 +210,8 @@ void LogosAPIClient::invokeRemoteMethodAsync(const QString& objectName, const QS
             [self, objectName](const QVariant& tokenResult) mutable {
                 if (!self) return;  // client destroyed mid-flight
                 const QString tok = tokenResult.toString();
+                // Cache the minted token before draining so future calls skip the handshake — m_pendingHandshakes only coalesces the first burst, the cache stops a second burst from racing the same rotation.
+                if (!tok.isEmpty()) self->m_token_manager->saveToken(objectName, tok);
                 // Drain every continuation queued for this target with the one
                 // minted token — the target was informed of exactly this token.
                 // An empty tok (handshake failed) still flows through: the

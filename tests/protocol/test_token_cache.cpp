@@ -1,0 +1,235 @@
+// Regression test for the IPC token-rotation race observed on Linux when
+// storage_ui made back-to-back sync invokeRemoteMethod calls.
+//
+// Bug: LogosAPIClient::invokeRemoteMethod minted a fresh capability token on
+// every cache miss but never wrote the result back to its TokenManager. On
+// Linux, QtRO's sync waitForFinished spins a nested QEventLoop that dispatches
+// other queued slots mid-wait — so each back-to-back sync call fired its own
+// requestModule, minted a new token, and informed the target. The target
+// stores ONE token per caller (ModuleProxy::saveToken replaces) so the latest
+// inform invalidated the earlier in-flight call's token and the target rejected
+// the call with "rejecting unauthorized call to <method> - auth token not
+// recognized".
+//
+// Fix: LogosAPIClient now writes the minted token into its TokenManager
+// immediately after requestModule returns (on both the sync and async paths),
+// so every subsequent call short-circuits the handshake.
+//
+// What this test asserts (the fix's invariant):
+//   * After N sync calls to the same target, capability_module.requestModule
+//     is invoked exactly ONCE — not N times.
+//   * After two back-to-back async bursts to the same target, the SECOND burst
+//     reuses the cached token without re-minting (the existing
+//     m_pendingHandshakes coalescer only collapses the FIRST burst).
+//   * Every call returns a valid result (i.e. no call gets rejected as
+//     unauthorized because the token was rotated under it).
+//
+// Without the fix the sync test fails with mintCount == N, and the async test
+// fails with mintCount == 2 (one per burst).
+
+#include <gtest/gtest.h>
+
+#include "logos_api_client.h"
+#include "logos_instance.h"
+#include "logos_provider_interface.h"
+#include "logos_transport_config.h"
+#include "module_proxy.h"
+#include "remote_transport.h"
+#include "token_manager.h"
+
+#include <QCoreApplication>
+#include <QJsonArray>
+#include <QString>
+#include <QUuid>
+#include <QVariantList>
+
+#include <atomic>
+#include <chrono>
+#include <thread>
+
+namespace {
+
+QCoreApplication* ensureApp() {
+    static int argc = 0;
+    static char* argv[] = { nullptr };
+    if (!QCoreApplication::instance())
+        new QCoreApplication(argc, argv);
+    return QCoreApplication::instance();
+}
+
+class PingProvider : public LogosProviderObject {
+public:
+    QVariant callMethod(const QString& method, const QVariantList&) override {
+        if (method == QLatin1String("ping")) return QStringLiteral("ok");
+        return QVariant();
+    }
+    bool informModuleToken(const QString& moduleName, const QString& token) override {
+        if (m_proxy) m_proxy->saveToken(moduleName, token);
+        return true;
+    }
+    QJsonArray getMethods() override { return QJsonArray{}; }
+    void setEventListener(EventCallback) override {}
+    void init(void*) override {}
+    QString providerName() const override { return QStringLiteral("target_module"); }
+    QString providerVersion() const override { return QStringLiteral("1.0.0"); }
+
+    void bindProxy(ModuleProxy* p) { m_proxy = p; }
+private:
+    ModuleProxy* m_proxy = nullptr;
+};
+
+class CapabilityProvider : public LogosProviderObject {
+public:
+    void bindTarget(ModuleProxy* targetProxy) { m_targetProxy = targetProxy; }
+
+    QVariant callMethod(const QString& method, const QVariantList& args) override {
+        if (method == QLatin1String("requestModule") && args.size() == 2) {
+            const QString from = args.value(0).toString();
+            const QString tok  = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            if (m_targetProxy) m_targetProxy->saveToken(from, tok);
+            m_mintCount.fetch_add(1, std::memory_order_relaxed);
+            return tok;
+        }
+        return QVariant();
+    }
+    bool informModuleToken(const QString&, const QString&) override { return true; }
+    QJsonArray getMethods() override { return QJsonArray{}; }
+    void setEventListener(EventCallback) override {}
+    void init(void*) override {}
+    QString providerName() const override { return QStringLiteral("capability_module"); }
+    QString providerVersion() const override { return QStringLiteral("1.0.0"); }
+
+    int mintCount() const { return m_mintCount.load(std::memory_order_relaxed); }
+private:
+    ModuleProxy* m_targetProxy = nullptr;
+    std::atomic<int> m_mintCount{0};
+};
+
+} // namespace
+
+class TokenCacheTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        ensureApp();
+        TokenManager::instance().clearAllTokens();
+    }
+    void TearDown() override {
+        TokenManager::instance().clearAllTokens();
+    }
+
+    void pumpEventLoop(int ms) {
+        auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+        while (std::chrono::steady_clock::now() < end) {
+            QCoreApplication::processEvents();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+};
+
+// N sync calls to the same un-tokened target ⇒ exactly ONE requestModule.
+// Pre-fix this fails with mintCount == N (and may also reject one of the
+// calls when the rotation race actually fires). Post-fix mintCount == 1
+// and all N calls succeed.
+TEST_F(TokenCacheTest, SyncCallsToSameTargetHandshakeOnce)
+{
+    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
+    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+
+    PingProvider targetProvider;
+    ModuleProxy  targetProxy(&targetProvider);
+    targetProvider.bindProxy(&targetProxy);
+
+    CapabilityProvider capProvider;
+    ModuleProxy        capProxy(&capProvider);
+    capProvider.bindTarget(&targetProxy);
+
+    const QString bootstrapToken = QStringLiteral("bootstrap-tok-sync");
+    TokenManager::instance().saveToken(QStringLiteral("capability_module"), bootstrapToken);
+    ASSERT_TRUE(capProxy.saveToken(QStringLiteral("test_origin"), bootstrapToken));
+
+    ASSERT_TRUE(capHost.publishObject("capability_module", &capProxy));
+    ASSERT_TRUE(targetHost.publishObject("target_module", &targetProxy));
+
+    LogosAPIClient client(QStringLiteral("target_module"),
+                          QStringLiteral("test_origin"),
+                          &TokenManager::instance());
+
+    for (int i = 0; i < 100 && !client.isConnected(); ++i) pumpEventLoop(20);
+    ASSERT_TRUE(client.isConnected());
+
+    constexpr int N = 5;
+    for (int i = 0; i < N; ++i) {
+        QVariant r = client.invokeRemoteMethod(QStringLiteral("target_module"),
+                                               QStringLiteral("ping"),
+                                               QVariantList{});
+        EXPECT_TRUE(r.isValid()) << "call #" << i << " returned invalid (auth rejected?)";
+        EXPECT_EQ(r.toString(), QStringLiteral("ok"));
+    }
+
+    EXPECT_EQ(capProvider.mintCount(), 1)
+        << "expected exactly one requestModule handshake per (client, target) "
+           "pair; got " << capProvider.mintCount() << ". Without client-side "
+           "token caching, every sync call re-mints — the token-rotation race "
+           "we are fixing.";
+}
+
+// Same invariant on the async path. Pre-PR#5 (the coalescer) this would also
+// fan out N handshakes; even with PR#5, only the FIRST burst is coalesced, so
+// a second burst (after the queue drains) would re-mint without the cache.
+// Post-fix: the cache is populated in the requestModule callback before the
+// drain, so the SECOND burst also short-circuits — exactly one mint total.
+TEST_F(TokenCacheTest, AsyncCallsToSameTargetHandshakeOnceAcrossBursts)
+{
+    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
+    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+
+    PingProvider targetProvider;
+    ModuleProxy  targetProxy(&targetProvider);
+    targetProvider.bindProxy(&targetProxy);
+
+    CapabilityProvider capProvider;
+    ModuleProxy        capProxy(&capProvider);
+    capProvider.bindTarget(&targetProxy);
+
+    const QString bootstrapToken = QStringLiteral("bootstrap-tok-async");
+    TokenManager::instance().saveToken(QStringLiteral("capability_module"), bootstrapToken);
+    ASSERT_TRUE(capProxy.saveToken(QStringLiteral("test_origin"), bootstrapToken));
+
+    ASSERT_TRUE(capHost.publishObject("capability_module", &capProxy));
+    ASSERT_TRUE(targetHost.publishObject("target_module", &targetProxy));
+
+    LogosAPIClient client(QStringLiteral("target_module"),
+                          QStringLiteral("test_origin"),
+                          &TokenManager::instance());
+
+    for (int i = 0; i < 100 && !client.isConnected(); ++i) pumpEventLoop(20);
+    ASSERT_TRUE(client.isConnected());
+
+    auto fireBurst = [&](int n) {
+        std::atomic<int> done{0};
+        std::atomic<int> ok{0};
+        for (int i = 0; i < n; ++i) {
+            client.invokeRemoteMethodAsync(
+                QStringLiteral("target_module"),
+                QStringLiteral("ping"),
+                QVariantList{},
+                [&done, &ok](QVariant r) {
+                    if (r.isValid() && r.toString() == QStringLiteral("ok"))
+                        ok.fetch_add(1);
+                    done.fetch_add(1);
+                });
+        }
+        for (int i = 0; i < 400 && done.load() < n; ++i) pumpEventLoop(20);
+        EXPECT_EQ(done.load(), n) << "not all async calls completed";
+        EXPECT_EQ(ok.load(),   n) << "some async calls were rejected unauthorized";
+    };
+
+    fireBurst(4); // first burst — coalesced by m_pendingHandshakes
+    fireBurst(4); // SECOND burst — relies on the cache, not the coalescer
+
+    EXPECT_EQ(capProvider.mintCount(), 1)
+        << "expected one handshake total across both bursts; got "
+        << capProvider.mintCount() << ". The first burst is coalesced by "
+           "m_pendingHandshakes; the second burst should reuse the cached "
+           "token written in the requestModule callback.";
+}
