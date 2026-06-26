@@ -26,6 +26,13 @@ add_executable(protocol_tests
     # transport — the path a deferred "multi" completion event takes, and where the
     # refresh_balances onClientRead re-entrancy crash lived.
     test_remote_transport_events.cpp
+    # Token caching: regression for the IPC token-rotation race that surfaced
+    # on Linux when storage_ui issued back-to-back sync invokeRemoteMethod
+    # calls. Pre-fix the client re-mints per call and the target's per-caller
+    # token slot is overwritten, causing earlier in-flight calls to be
+    # rejected as unauthorized. Post-fix exactly one handshake fires per
+    # (client, target) pair.
+    test_token_cache.cpp
     # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
     # in-process Qt-event-loop deadlock between consumer + provider under
     # nix's test sandbox; exercised cross-process by the integration matrix).
