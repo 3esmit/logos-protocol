@@ -13,7 +13,6 @@ ModuleProxy::ModuleProxy(LogosProviderObject* provider, QObject* parent)
 {
     if (m_provider) {
         m_provider->setEventListener([this](const QString& eventName, const QVariantList& data) {
-            qDebug() << "[LogosProviderObject] ModuleProxy: forwarding event" << eventName << "as Qt signal";
             // Events may be fired from any thread (e.g. a module's worker/FFI
             // thread), but this object is the QtRemoteObjects source and must be
             // driven from its own thread. Emitting directly from a foreign
@@ -100,9 +99,7 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
     }
 
     // SECURITY: never log call arguments — they routinely carry secrets
-    // (mnemonics, passwords, tokens, key material). Log only the method name and
-    // the argument count, matching the other transport call sites.
-    qDebug() << "ModuleProxy: callRemoteMethod" << methodName << "args:" << args.size();
+    // (mnemonics, passwords, tokens, key material).
     return m_provider->callMethod(methodName, args);
 }
 
@@ -206,7 +203,6 @@ QJsonArray ModuleProxy::getPluginInterface()
 {
     if (!m_provider) return QJsonArray();
 
-    qDebug() << "[LogosProviderObject] ModuleProxy: calling LogosProviderObject::getMethods()";
     return m_provider->getMethods();
 }
 
