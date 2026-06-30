@@ -99,7 +99,10 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
         return QVariant();
     }
 
-    qDebug() << "ModuleProxy: callRemoteMethod" << methodName << "args:" << args;
+    // SECURITY: never log call arguments — they routinely carry secrets
+    // (mnemonics, passwords, tokens, key material). Log only the method name and
+    // the argument count, matching the other transport call sites.
+    qDebug() << "ModuleProxy: callRemoteMethod" << methodName << "args:" << args.size();
     return m_provider->callMethod(methodName, args);
 }
 
