@@ -139,9 +139,16 @@ typedef void (*lp_event_cb)(const char* event_name, const char* data_json,
  * flow (this library dials `capability_module` transparently the first time
  * a target requires a token — every language gets that flow for free).
  *
- * The calling thread becomes the client's owner thread; with the Qt Remote
- * Objects transport it must run a Qt event loop. Returns NULL on invalid
- * arguments.
+ * Runtime requirements depend on the transport. The Qt Remote Objects
+ * transport (LocalSocket) makes the calling thread the client's owner thread
+ * and requires a running Qt event loop. The PLAIN transports (tcp / tcp_ssl)
+ * are Qt-free: calls, async completions and events run on the library's own
+ * I/O thread and need NO QCoreApplication or event loop — which is what lets a
+ * pure-lp_* SDK (e.g. a node process) consume modules with no Qt runtime.
+ *
+ * Returns NULL on invalid arguments. Over a plain transport the client is still
+ * returned when the target is not yet listening; calls then report a canonical
+ * object_unavailable error until it comes up.
  */
 lp_client* lp_client_create(const char* target_module,
                             const char* origin_module,
@@ -174,8 +181,11 @@ int lp_invoke(lp_client* client,
 
 /**
  * Asynchronous variant of lp_invoke. Returns LP_OK if the call was
- * dispatched; `cb` then fires exactly once with the result (from the
- * client's owner thread). Safe to call from any thread.
+ * dispatched; `cb` then fires exactly once with the result. Safe to call from
+ * any thread. The callback runs on the client's owner thread for the Qt
+ * transport, or on the library's I/O thread for the plain transports — in
+ * either case never inline before this returns. After lp_client_destroy no
+ * callback fires (a call in flight at destroy may simply be dropped).
  */
 int lp_invoke_async(lp_client* client,
                     const char* method,

@@ -24,6 +24,7 @@ nlohmann::json        valueToJson(const RpcValue& v);
 RpcValue              jsonToValue(const nlohmann::json& j);
 nlohmann::json        argsToJson(const std::vector<RpcValue>& args);
 std::vector<RpcValue> argsFromJson(const nlohmann::json& j);
+nlohmann::json        methodToJson(const MethodMetadata& m);
 MethodMetadata        methodFromJson(const nlohmann::json& j);
 
 } // namespace logos::plain

@@ -30,6 +30,13 @@ public:
     QString endpointUrl(const QString& instanceId,
                         const QString& moduleName) override;
 
+    // The raw, Qt-free RPC connection opened by connectToHost() (null until
+    // then). Exposed so the Qt-free consumer (LpPlainClient) can drive the wire
+    // directly with std/json instead of going through the QVariant-typed
+    // PlainLogosObject. Ownership stays here — the caller keeps this
+    // PlainTransportConnection alive for as long as it uses the connection.
+    std::shared_ptr<RpcConnectionBase> connection() const { return m_conn; }
+
 private:
     LogosTransportConfig               m_cfg;
     std::shared_ptr<RpcConnectionBase> m_conn;

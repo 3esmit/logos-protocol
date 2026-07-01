@@ -50,6 +50,14 @@ public:
     virtual std::future<ResultMessage>        sendCall(CallMessage msg) = 0;
     virtual std::future<MethodsResultMessage> sendMethods(MethodsMessage msg) = 0;
 
+    // Callback variant of sendCall: `cb` fires exactly once, on the connection's
+    // Asio I/O thread, when the matching Result lands (or with a synthetic
+    // !ok/errCode result if the connection is/goes down). This is the loop-free
+    // async seam the Qt-free consumer uses instead of a thread-per-call waiter
+    // that hops back to the Qt event loop. The caller sets msg.id (nextId()).
+    virtual void sendCallCb(CallMessage msg,
+                            std::function<void(ResultMessage)> cb) = 0;
+
     virtual void sendSubscribe(SubscribeMessage msg,
                                std::function<void(EventMessage)> callback) = 0;
     virtual void sendUnsubscribe(UnsubscribeMessage msg) = 0;
@@ -89,6 +97,8 @@ public:
 
     std::future<ResultMessage>        sendCall(CallMessage msg) override;
     std::future<MethodsResultMessage> sendMethods(MethodsMessage msg) override;
+    void sendCallCb(CallMessage msg,
+                    std::function<void(ResultMessage)> cb) override;
 
     void sendSubscribe(SubscribeMessage msg,
                        std::function<void(EventMessage)> callback) override;
@@ -129,6 +139,7 @@ private:
     // Outgoing-pending maps
     std::mutex                                   m_mu;
     std::map<uint64_t, std::shared_ptr<std::promise<ResultMessage>>>        m_pendingCalls;
+    std::map<uint64_t, std::function<void(ResultMessage)>>                  m_pendingCallCbs;
     std::map<uint64_t, std::shared_ptr<std::promise<MethodsResultMessage>>> m_pendingMethods;
 
     using EventKey = std::pair<std::string, std::string>; // object, event
@@ -213,6 +224,7 @@ void RpcConnection<Stream>::dispatchIncoming(AnyMessage msg)
 
         if constexpr (std::is_same_v<T, ResultMessage>) {
             std::shared_ptr<std::promise<ResultMessage>> p;
+            std::function<void(ResultMessage)> cb;
             {
                 std::lock_guard<std::mutex> g(m_mu);
                 auto it = m_pendingCalls.find(m.id);
@@ -220,8 +232,16 @@ void RpcConnection<Stream>::dispatchIncoming(AnyMessage msg)
                     p = std::move(it->second);
                     m_pendingCalls.erase(it);
                 }
+                auto cit = m_pendingCallCbs.find(m.id);
+                if (cit != m_pendingCallCbs.end()) {
+                    cb = std::move(cit->second);
+                    m_pendingCallCbs.erase(cit);
+                }
             }
-            if (p) p->set_value(std::forward<decltype(m)>(m));
+            // An id lands in exactly one pending map (future OR callback), so
+            // these are mutually exclusive — move into whichever is present.
+            if (p)       p->set_value(std::move(m));
+            else if (cb) cb(std::move(m)); // fires on this (Asio I/O) thread — loop-free async
 
         } else if constexpr (std::is_same_v<T, MethodsResultMessage>) {
             std::shared_ptr<std::promise<MethodsResultMessage>> p;
@@ -303,6 +323,24 @@ RpcConnection<Stream>::sendCall(CallMessage msg)
     }
     writeFrame(encodeFrame(*m_codec, AnyMessage{std::move(msg)}));
     return f;
+}
+
+template <typename Stream>
+void RpcConnection<Stream>::sendCallCb(CallMessage msg,
+                                      std::function<void(ResultMessage)> cb)
+{
+    if (m_stopped.load()) {
+        ResultMessage r;
+        r.id = msg.id; r.ok = false;
+        r.err = "connection stopped"; r.errCode = "TRANSPORT_CLOSED";
+        if (cb) cb(std::move(r));
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> g(m_mu);
+        m_pendingCallCbs[msg.id] = std::move(cb);
+    }
+    writeFrame(encodeFrame(*m_codec, AnyMessage{std::move(msg)}));
 }
 
 template <typename Stream>
@@ -398,11 +436,13 @@ void RpcConnection<Stream>::fail(const std::string& reason)
 
     // Fail every pending promise with a transport-level error.
     std::map<uint64_t, std::shared_ptr<std::promise<ResultMessage>>>        calls;
+    std::map<uint64_t, std::function<void(ResultMessage)>>                  callCbs;
     std::map<uint64_t, std::shared_ptr<std::promise<MethodsResultMessage>>> methods;
     ErrorHandler errCb;
     {
         std::lock_guard<std::mutex> g(m_mu);
         calls.swap(m_pendingCalls);
+        callCbs.swap(m_pendingCallCbs);
         methods.swap(m_pendingMethods);
         errCb.swap(m_error);
         m_eventCallbacks.clear();
@@ -411,6 +451,12 @@ void RpcConnection<Stream>::fail(const std::string& reason)
         ResultMessage r; r.id = id; r.ok = false;
         r.err = reason; r.errCode = "TRANSPORT_ERROR";
         try { p->set_value(std::move(r)); } catch (...) {}
+    }
+    // Callback waiters must also be released so async callers never hang.
+    for (auto& [id, cb] : callCbs) {
+        ResultMessage r; r.id = id; r.ok = false;
+        r.err = reason; r.errCode = "TRANSPORT_ERROR";
+        try { cb(std::move(r)); } catch (...) {}
     }
     for (auto& [id, p] : methods) {
         MethodsResultMessage r; r.id = id; r.ok = false; r.err = reason;

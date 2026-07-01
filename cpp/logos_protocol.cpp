@@ -10,6 +10,7 @@
 #include "logos_transport_config_json.h"
 #include "logos_transport_factory.h"
 #include "logos_types.h"
+#include "lp_plain_client.h"
 #include "lp_provider_dispatch.h"
 #include "token_manager.h"
 
@@ -106,7 +107,11 @@ bool parseArgs(const char* args_json, const QString& origin,
 } // namespace
 
 struct lp_client {
+    // Exactly one backend is set. `client` = the Qt LogosAPIClient (QtRO /
+    // Local / Mock). `plain` = the Qt-free plain consumer (TCP / TCP+SSL),
+    // which needs no QCoreApplication or Qt event loop.
     LogosAPIClient* client = nullptr;
+    std::unique_ptr<logos::plain::LpPlainClient> plain;
     QString target;
     QString origin;
     std::shared_ptr<CbGuard> guard;
@@ -213,6 +218,26 @@ lp_client* lp_client_create(const char* target_module,
     handle->target = QString::fromUtf8(target_module);
     handle->origin = QString::fromUtf8(origin_module);
     handle->guard = std::make_shared<CbGuard>();
+
+    // Qt-free plain path: in Remote mode over a plain wire protocol (TCP /
+    // TCP+SSL) build an LpPlainClient — no QObject, no QCoreApplication, no Qt
+    // event loop. Any other mode/protocol (QtRO LocalSocket, Local, Mock) keeps
+    // the LogosAPIClient path unchanged. Local/Mock ignore cfg.protocol, so we
+    // must gate on isRemote() too or we'd hijack those in-process transports.
+    const bool plainWire = LogosModeConfig::isRemote()
+        && (targetCfg.protocol == LogosProtocol::Tcp
+            || targetCfg.protocol == LogosProtocol::TcpSsl);
+
+    if (plainWire) {
+        handle->plain = logos::plain::LpPlainClient::create(
+            target_module, origin_module, targetCfg, capabilityCfg);
+        if (!handle->plain) {
+            delete handle;
+            return nullptr; // target endpoint unreachable
+        }
+        return handle;
+    }
+
     // No QObject parent: the handle owns the client. Constructed on the
     // calling thread, which becomes the owner thread (see header contract).
     handle->client = new LogosAPIClient(handle->target, handle->origin,
@@ -229,6 +254,10 @@ void lp_client_destroy(lp_client* client)
         std::lock_guard<std::recursive_mutex> lock(client->guard->mutex);
         client->guard->alive = false;
     }
+    // Plain path: shutdown() stops the wire and quiesces any in-flight
+    // I/O-thread callback before the object is freed (its own latch).
+    if (client->plain) client->plain->shutdown();
+    client->plain.reset();
     delete client->client;
     delete client;
 }
@@ -244,11 +273,31 @@ int lp_invoke(lp_client* client,
 {
     if (out_result_json) *out_result_json = nullptr;
     if (out_error_json) *out_error_json = nullptr;
-    if (!client || !client->client || !method || !*method) {
+    if (!client || (!client->client && !client->plain) || !method || !*method) {
         if (out_error_json)
             *out_error_json = lpStrdup(makeErrorJson(
                 "invalid_arg", "client and method are required", ""));
         return LP_ERR_INVALID_ARG;
+    }
+
+    // Qt-free plain path: parse + convert happen inside LpPlainClient (JSON in,
+    // JSON out) with no QVariant round-trip.
+    if (client->plain) {
+        std::string resultJson, errCode, errMsg;
+        const bool ok = client->plain->invoke(
+            method, args_json ? args_json : "", timeout_ms,
+            &resultJson, &errCode, &errMsg);
+        if (!ok) {
+            if (out_error_json)
+                // origin = the target module (where the failure originated),
+                // matching the Qt consumer's canonical error shape.
+                *out_error_json = lpStrdup(makeErrorJson(
+                    errCode.c_str(), errMsg, client->target.toStdString()));
+            return errCode == "invalid_args" ? LP_ERR_INVALID_ARG
+                                             : LP_ERR_UNAVAILABLE;
+        }
+        if (out_result_json) *out_result_json = lpStrdup(resultJson);
+        return LP_OK;
     }
 
     QVariantList args;
@@ -281,8 +330,36 @@ int lp_invoke_async(lp_client* client,
                     lp_result_cb cb,
                     void* user_data)
 {
-    if (!client || !client->client || !method || !*method || !cb)
+    if (!client || (!client->client && !client->plain) || !method || !*method || !cb)
         return LP_ERR_INVALID_ARG;
+
+    // Qt-free plain path: deliver on the Asio I/O thread (no Qt event loop).
+    if (client->plain) {
+        // Validate args up front so malformed input is a synchronous error
+        // (matches the ABI: bad args → LP_ERR_INVALID_ARG, no callback).
+        if (args_json && *args_json) {
+            nlohmann::json p = nlohmann::json::parse(args_json, nullptr, false);
+            if (p.is_discarded() || !p.is_array()) return LP_ERR_INVALID_ARG;
+        }
+        std::shared_ptr<CbGuard> guard = client->guard;
+        const std::string origin = client->target.toStdString(); // error origin = target
+        client->plain->invokeAsync(
+            method, args_json ? args_json : "", timeout_ms,
+            [guard, cb, user_data, origin](bool ok, const std::string& resultJson,
+                                           const std::string& errCode,
+                                           const std::string& errMsg) {
+                std::lock_guard<std::recursive_mutex> lock(guard->mutex);
+                if (!guard->alive) return; // client destroyed: drop the result
+                if (ok) {
+                    cb(1, resultJson.c_str(), user_data);
+                } else {
+                    const std::string errJson =
+                        makeErrorJson(errCode.c_str(), errMsg, origin);
+                    cb(0, errJson.c_str(), user_data);
+                }
+            });
+        return LP_OK;
+    }
 
     QVariantList args;
     std::string error;
@@ -309,8 +386,28 @@ lp_subscription* lp_subscribe(lp_client* client,
                               lp_event_cb cb,
                               void* user_data)
 {
-    if (!client || !client->client || !event_name || !*event_name || !cb)
+    if (!client || (!client->client && !client->plain)
+        || !event_name || !*event_name || !cb)
         return nullptr;
+
+    // Qt-free plain path: events fire on the Asio I/O thread.
+    if (client->plain) {
+        auto* sub = new lp_subscription();
+        sub->guard = std::make_shared<CbGuard>();
+        std::shared_ptr<CbGuard> subGuard = sub->guard;
+        std::shared_ptr<CbGuard> clientGuard = client->guard;
+        client->plain->subscribe(
+            event_name,
+            [subGuard, clientGuard, cb, user_data](const std::string& name,
+                                                   const std::string& dataJson) {
+                std::lock_guard<std::recursive_mutex> subLock(subGuard->mutex);
+                if (!subGuard->alive) return;      // unsubscribed
+                std::lock_guard<std::recursive_mutex> clientLock(clientGuard->mutex);
+                if (!clientGuard->alive) return;   // client destroyed
+                cb(name.c_str(), dataJson.c_str(), user_data);
+            });
+        return sub;
+    }
 
     LogosObject* object = client->client->requestObject(client->target);
     if (!object) return nullptr;
@@ -355,7 +452,8 @@ void lp_unsubscribe(lp_subscription* sub)
 
 char* lp_get_methods(lp_client* client)
 {
-    if (!client || !client->client) return nullptr;
+    if (!client || (!client->client && !client->plain)) return nullptr;
+    if (client->plain) return lpStrdup(client->plain->getMethodsJson());
     LogosObject* object = client->client->requestObject(client->target);
     if (!object) return nullptr;
     const QJsonArray methods = object->getMethods();
@@ -389,8 +487,14 @@ int lp_inform_module_token(lp_client* client,
                            const char* module_name,
                            const char* token)
 {
-    if (!client || !client->client || !auth_token || !module_name || !token)
+    if (!client || (!client->client && !client->plain)
+        || !auth_token || !module_name || !token)
         return LP_ERR_INVALID_ARG;
+    if (client->plain) {
+        const bool ok = client->plain->informModuleToken(
+            auth_token, module_name, token);
+        return ok ? LP_OK : LP_ERR_INTERNAL;
+    }
     const bool ok = client->client->informModuleToken(
         QString::fromUtf8(auth_token), QString::fromUtf8(module_name),
         QString::fromUtf8(token));

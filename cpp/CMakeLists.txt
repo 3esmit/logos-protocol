@@ -36,6 +36,8 @@ set(PROTOCOL_SOURCES
     module_proxy.h
     lp_provider_dispatch.cpp
     lp_provider_dispatch.h
+    lp_plain_client.cpp
+    lp_plain_client.h
     token_manager.cpp
     token_manager.h
     logos_mode.h
