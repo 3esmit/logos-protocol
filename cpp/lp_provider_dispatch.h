@@ -61,7 +61,18 @@ public:
     void emitEvent(const std::string& eventName, const std::string& dataJson);
     void setEventSink(EventSink sink);
 
+    // Quiesce for teardown: blocks until any in-flight callMethod / emitEvent /
+    // informModuleToken finishes, then forbids new ones (they become no-ops).
+    // lp_provider_destroy calls this BEFORE dropping the hosts / this object, so
+    // the io-thread dispatch and the caller's emit can never touch a torn-down
+    // host or invoke a user callback on a torn-down module. Mirrors the client's
+    // CbGuard teardown latch.
+    void shutdown();
+
 private:
+    // m_mu must be held for the FULL duration of callMethod/emitEvent (across the
+    // user callback + the event sink), so shutdown() can wait them out. Recursive
+    // because the introspection fast-path calls interfaceJson() re-entrantly.
     bool isAuthorized(const std::string& token) const;
 
     std::string      m_name;
@@ -70,7 +81,8 @@ private:
     lp_token_cb      m_onToken;
     void*            m_userData;
 
-    mutable std::mutex                           m_mu;
+    mutable std::recursive_mutex                 m_mu;
+    bool                                         m_alive = true;
     std::unordered_map<std::string, std::string> m_tokens;
     EventSink                                    m_sink;
 };

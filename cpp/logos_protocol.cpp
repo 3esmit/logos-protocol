@@ -125,8 +125,11 @@ struct lp_provider {
     void* userData = nullptr;
 
     // Serving state, populated by lp_provider_register (Qt-free plain path):
-    // one dispatch published on one or more plain transport hosts.
-    std::unique_ptr<logos::plain::LpProviderDispatch>   serving;
+    // one dispatch published on one or more plain transport hosts. shared_ptr
+    // (also held by each host's Published entry) so an inbound call on the I/O
+    // thread keeps the dispatch alive during dispatch; destroy quiesces via
+    // LpProviderDispatch::shutdown() first.
+    std::shared_ptr<logos::plain::LpProviderDispatch>   serving;
     std::vector<std::unique_ptr<LogosTransportHost>>    hosts;
     QString                                             registeredName;
 };
@@ -410,9 +413,12 @@ lp_provider* lp_provider_create(const char* module_name,
 void lp_provider_destroy(lp_provider* provider)
 {
     if (!provider) return;
-    // Tear serving down before dropping the dispatch: unpublish on every host
-    // (which clears the host's event sink into our dispatch), drop the hosts,
-    // then the dispatch.
+    // Quiesce first: shutdown() blocks until any in-flight inbound call / emit
+    // finishes and forbids new ones (dropping the sink that captures the hosts),
+    // so the teardown below can't race the I/O thread. THEN unpublish, drop the
+    // hosts, and drop this owner's dispatch ref (an in-flight call may still hold
+    // its own shared_ptr copy and outlive this — harmless, it's now inert).
+    if (provider->serving) provider->serving->shutdown();
     if (!provider->registeredName.isEmpty()) {
         for (auto& h : provider->hosts)
             if (h) h->unpublishObject(provider->registeredName);
@@ -442,14 +448,14 @@ int lp_provider_register(lp_provider* provider,
     // Build the Qt-free dispatch, then publish it on every configured plain
     // transport host. Non-plain (QtRO) hosts can't serve a Qt-free dispatch and
     // are skipped — this path is plain (TCP/TCP+SSL) only for now.
-    auto serving = std::make_unique<logos::plain::LpProviderDispatch>(
+    auto serving = std::make_shared<logos::plain::LpProviderDispatch>(
         provider->moduleName, dispatch, get_methods, on_token, user_data);
 
     bool published = false;
     auto tryPublish = [&](std::unique_ptr<LogosTransportHost> host) {
         if (!host) return;
         auto* plain = dynamic_cast<logos::plain::PlainTransportHost*>(host.get());
-        if (plain && plain->publishObjectStd(name, serving.get())) {
+        if (plain && plain->publishObjectStd(name, serving)) {
             published = true;
             provider->hosts.push_back(std::move(host));
         }

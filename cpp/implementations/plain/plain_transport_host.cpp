@@ -302,7 +302,8 @@ bool PlainTransportHost::publishObject(const QString& name, QObject* object)
     return true;
 }
 
-bool PlainTransportHost::publishObjectStd(const QString& name, LpProviderDispatch* dispatch)
+bool PlainTransportHost::publishObjectStd(const QString& name,
+                                          std::shared_ptr<LpProviderDispatch> dispatch)
 {
     if (!dispatch) return false;
     std::lock_guard<std::mutex> g(m_mu);
@@ -336,9 +337,12 @@ void PlainTransportHost::unpublishObject(const QString& name)
     std::lock_guard<std::mutex> g(m_mu);
     auto it = m_published.find(name.toStdString());
     if (it == m_published.end()) return;
-    if (it->second.stdDispatch)
-        it->second.stdDispatch->setEventSink(nullptr); // drop our captured `this`
-    else
+    // Std path: the owner must call LpProviderDispatch::shutdown() before
+    // unpublishing (lp_provider_destroy does), which already dropped the sink
+    // capturing this host — so we must NOT take the dispatch lock here (doing so
+    // under m_mu would invert the emit path's dispatch->host lock order). Just
+    // drop our shared_ptr by erasing the entry. Legacy QObject path: disconnect.
+    if (!it->second.stdDispatch)
         QObject::disconnect(it->second.eventConn);
     m_published.erase(it);
 }
@@ -365,7 +369,7 @@ void PlainTransportHost::fanOutEvent(const std::string& name, EventMessage msg)
 void PlainTransportHost::onCall(const CallMessage& req, CallReply reply)
 {
     QObject* obj = nullptr;
-    LpProviderDispatch* dispatch = nullptr;
+    std::shared_ptr<LpProviderDispatch> dispatch;
     {
         std::lock_guard<std::mutex> g(m_mu);
         auto it = m_published.find(req.object);
@@ -434,7 +438,7 @@ void PlainTransportHost::onCall(const CallMessage& req, CallReply reply)
 void PlainTransportHost::onMethods(const MethodsMessage& req, MethodsReply reply)
 {
     QObject* obj = nullptr;
-    LpProviderDispatch* dispatch = nullptr;
+    std::shared_ptr<LpProviderDispatch> dispatch;
     {
         std::lock_guard<std::mutex> g(m_mu);
         auto it = m_published.find(req.object);
@@ -527,7 +531,7 @@ void PlainTransportHost::onConnectionClosed(const void* connectionId)
 void PlainTransportHost::onToken(const TokenMessage& req)
 {
     QObject* obj = nullptr;
-    LpProviderDispatch* dispatch = nullptr;
+    std::shared_ptr<LpProviderDispatch> dispatch;
     {
         std::lock_guard<std::mutex> g(m_mu);
         // Route token to the module matching req.moduleName if we host

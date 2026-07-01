@@ -137,6 +137,30 @@ TEST(LpProviderServing, ServesCallsAndEventsOverPlainTcpWithoutQtLoop)
         EXPECT_EQ(res.errCode, "UNAUTHORIZED");
     }
 
+    // (4) A peer cannot self-authorize by registering its own token over the
+    // (unauthenticated) wire: informModuleToken default-rejects, so a call with
+    // the just-"registered" token is still unauthorized. (Sent on the same
+    // connection, so it is processed before the round-trip call below.)
+    {
+        logos::plain::TokenMessage tm;
+        tm.authToken = "";           // no trusted core/capability channel
+        tm.moduleName = "attacker";
+        tm.token = "sneaky-token";
+        conn->sendToken(std::move(tm));
+
+        logos::plain::CallMessage c;
+        c.id = conn->nextId();
+        c.authToken = "sneaky-token";
+        c.object = "serve_module";
+        c.method = "echo";
+        c.args = logos::plain::argsFromJson(nlohmann::json::parse(R"(["x"])"));
+        auto f = conn->sendCall(std::move(c));
+        ASSERT_EQ(f.wait_for(3s), std::future_status::ready);
+        auto res = f.get();
+        EXPECT_FALSE(res.ok) << "self-registered token must NOT authorize";
+        EXPECT_EQ(res.errCode, "UNAUTHORIZED");
+    }
+
     conn->stop();
     lp_provider_destroy(prov);
 }

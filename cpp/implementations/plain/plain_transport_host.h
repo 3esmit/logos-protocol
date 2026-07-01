@@ -43,10 +43,12 @@ public:
     void unpublishObject(const QString& name) override;
 
     // Qt-free provider publish: serves an LpProviderDispatch directly on the
-    // Asio I/O thread (no QObject/ModuleProxy, no Qt event loop). The dispatch
-    // is owned by the caller and must outlive the publication (unpublish clears
-    // the host's event sink into it). Returns false if a name is already published.
-    bool publishObjectStd(const QString& name, LpProviderDispatch* dispatch);
+    // Asio I/O thread (no QObject/ModuleProxy, no Qt event loop). The host keeps
+    // a shared_ptr so an in-flight inbound call on the I/O thread can't race a
+    // free; the owner quiesces via LpProviderDispatch::shutdown() before dropping
+    // it. Returns false if a name is already published.
+    bool publishObjectStd(const QString& name,
+                          std::shared_ptr<LpProviderDispatch> dispatch);
 
     QString bindUrl(const QString& instanceId,
                     const QString& moduleName) override;
@@ -76,9 +78,10 @@ public:
 private:
     struct Published {
         // Exactly one of these is set. `object` = the legacy Qt ModuleProxy
-        // path; `stdDispatch` = the Qt-free LpProviderDispatch path.
+        // path; `stdDispatch` = the Qt-free LpProviderDispatch path (held by
+        // shared_ptr so an inbound I/O-thread call keeps it alive during dispatch).
         QObject* object = nullptr;
-        LpProviderDispatch* stdDispatch = nullptr;
+        std::shared_ptr<LpProviderDispatch> stdDispatch;
         // Tracked event subscribers per event name (including "" wildcard).
         std::map<std::string, std::map<const void*, EventSink>> sinksByEvent;
         QMetaObject::Connection eventConn; // only used for the QObject path
