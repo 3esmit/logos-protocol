@@ -51,7 +51,10 @@ LpProviderDispatch::LpProviderDispatch(std::string moduleName,
 
 std::string LpProviderDispatch::interfaceJson()
 {
-    std::lock_guard<std::recursive_mutex> g(m_mu);
+    // No lock held: m_getMethods/m_userData are set once at construction and
+    // never change, and m_getMethods is a USER callback that may BLOCK (an FFI
+    // runtime marshaling it to another thread) and RE-ENTER the provider.
+    // Holding m_mu across it would deadlock — see callMethod's note.
     if (!m_getMethods) return "[]";
     std::string s = takeString(m_getMethods(m_userData));
     return s.empty() ? "[]" : s;
@@ -62,19 +65,21 @@ std::string LpProviderDispatch::callMethod(const std::string& authToken,
                                            const std::string& argsJson,
                                            bool* ok, std::string* errCode)
 {
-    std::lock_guard<std::recursive_mutex> g(m_mu);
     auto fail = [&](const char* code) -> std::string {
         if (ok) *ok = false;
         if (errCode) *errCode = code;
         return std::string();
     };
-    if (!m_alive) return fail("UNAVAILABLE"); // provider shutting down
 
     // Ungated introspection — a caller discovers the interface before any token
     // exists (mirrors ModuleProxy's getPlugin* fast-path). getMethods returns
     // the full interface; getPluginMethods/Events split it by the "type" tag.
+    // interfaceJson() invokes the user getMethods callback, so it runs WITHOUT
+    // m_mu held (see the dispatch note below).
     if (method == "getPluginInterface" || method == "getPluginMethods"
         || method == "getPluginEvents") {
+        { std::lock_guard<std::recursive_mutex> g(m_mu);
+          if (!m_alive) return fail("UNAVAILABLE"); }
         nlohmann::json iface = nlohmann::json::parse(interfaceJson(), nullptr, false);
         if (!iface.is_array()) iface = nlohmann::json::array();
         if (method == "getPluginInterface") { if (ok) *ok = true; return iface.dump(); }
@@ -89,17 +94,35 @@ std::string LpProviderDispatch::callMethod(const std::string& authToken,
         return out.dump();
     }
 
-    if (!isAuthorized(authToken)) {
-        spdlog::warn("[lp_provider] {}: rejecting unauthorized call to {}",
-                     m_name, method);
-        return fail("UNAUTHORIZED");
+    // Auth is state (m_tokens) — check it under the lock and copy the immutable
+    // dispatch pointer, then RELEASE m_mu before invoking the user callback.
+    lp_dispatch_cb dispatch;
+    {
+        std::lock_guard<std::recursive_mutex> g(m_mu);
+        if (!m_alive) return fail("UNAVAILABLE"); // provider shutting down
+        if (!isAuthorized(authToken)) {
+            spdlog::warn("[lp_provider] {}: rejecting unauthorized call to {}",
+                         m_name, method);
+            return fail("UNAUTHORIZED");
+        }
+        dispatch = m_dispatch;
     }
-    if (!m_dispatch) return fail("METHOD_FAILED");
+    if (!dispatch) return fail("METHOD_FAILED");
 
-    // Per the ABI, the dispatch callback returns NULL on failure and any
-    // non-NULL heap string (even empty) on success. Check the raw pointer so an
-    // empty-string result is NOT misread as a failure.
-    char* raw = m_dispatch(method.c_str(), argsJson.c_str(), m_userData);
+    // Invoke the user dispatch OUTSIDE m_mu. It may BLOCK (an FFI runtime
+    // marshals the callback to its own thread) and may RE-ENTER the provider
+    // (e.g. emitEvent, which also takes m_mu) — holding m_mu across it would
+    // deadlock such a provider (the exact hang a Node/koffi provider hit when it
+    // emitted an event while a dispatch was in flight). The host keeps `this`
+    // alive via shared_ptr for the call's duration, and the host's I/O-thread
+    // teardown barrier quiesces in-flight calls before the dispatch is dropped;
+    // a concurrent shutdown() flipping m_alive / clearing the sink is harmless
+    // (we don't touch them past this point).
+    //
+    // Per the ABI the callback returns NULL on failure and any non-NULL heap
+    // string (even empty) on success — check the raw pointer so an empty-string
+    // result is NOT misread as a failure.
+    char* raw = dispatch(method.c_str(), argsJson.c_str(), m_userData);
     if (!raw) return fail("METHOD_FAILED");
     std::string result(raw);
     lp_string_free(raw);
