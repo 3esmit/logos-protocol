@@ -17,6 +17,15 @@ namespace logos::plain {
 nlohmann::json   messageToJson(const AnyMessage& msg);
 AnyMessage       jsonToMessage(MessageType tag, const nlohmann::json& j);
 
+// Per-value RpcValue <-> json (the canonical in-memory form). Exposed so the
+// Qt-free provider/consumer dispatch paths can convert wire values to/from
+// JSON without going through QVariant.
+nlohmann::json        valueToJson(const RpcValue& v);
+RpcValue              jsonToValue(const nlohmann::json& j);
+nlohmann::json        argsToJson(const std::vector<RpcValue>& args);
+std::vector<RpcValue> argsFromJson(const nlohmann::json& j);
+MethodMetadata        methodFromJson(const nlohmann::json& j);
+
 } // namespace logos::plain
 
 #endif // LOGOS_PLAIN_JSON_MAPPING_H

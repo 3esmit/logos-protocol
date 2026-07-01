@@ -1,13 +1,19 @@
 #include "logos_protocol.h"
 
 #include "logos_api_client.h"
+#include "logos_instance.h"
 #include "logos_json_convert.h"
 #include "logos_mode.h"
 #include "logos_object.h"
+#include "logos_transport.h"
 #include "logos_transport_config.h"
 #include "logos_transport_config_json.h"
+#include "logos_transport_factory.h"
 #include "logos_types.h"
+#include "lp_provider_dispatch.h"
 #include "token_manager.h"
+
+#include "implementations/plain/plain_transport_host.h"
 
 #include <nlohmann/json.hpp>
 
@@ -23,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -116,6 +123,12 @@ struct lp_provider {
     lp_getmethods_cb getMethods = nullptr;
     lp_token_cb onToken = nullptr;
     void* userData = nullptr;
+
+    // Serving state, populated by lp_provider_register (Qt-free plain path):
+    // one dispatch published on one or more plain transport hosts.
+    std::unique_ptr<logos::plain::LpProviderDispatch>   serving;
+    std::vector<std::unique_ptr<LogosTransportHost>>    hosts;
+    QString                                             registeredName;
 };
 
 extern "C" {
@@ -396,6 +409,16 @@ lp_provider* lp_provider_create(const char* module_name,
 
 void lp_provider_destroy(lp_provider* provider)
 {
+    if (!provider) return;
+    // Tear serving down before dropping the dispatch: unpublish on every host
+    // (which clears the host's event sink into our dispatch), drop the hosts,
+    // then the dispatch.
+    if (!provider->registeredName.isEmpty()) {
+        for (auto& h : provider->hosts)
+            if (h) h->unpublishObject(provider->registeredName);
+    }
+    provider->hosts.clear();
+    provider->serving.reset();
     delete provider;
 }
 
@@ -406,10 +429,49 @@ int lp_provider_register(lp_provider* provider,
                          void* user_data)
 {
     if (!provider || !dispatch) return LP_ERR_INVALID_ARG;
-    provider->dispatch = dispatch;
+    if (provider->serving) return LP_ERR_INTERNAL; // already registered
+
+    provider->dispatch   = dispatch;
     provider->getMethods = get_methods;
-    provider->onToken = on_token;
-    provider->userData = user_data;
+    provider->onToken    = on_token;
+    provider->userData   = user_data;
+
+    const QString name        = QString::fromStdString(provider->moduleName);
+    const QString registryUrl = LogosInstance::id(name);
+
+    // Build the Qt-free dispatch, then publish it on every configured plain
+    // transport host. Non-plain (QtRO) hosts can't serve a Qt-free dispatch and
+    // are skipped — this path is plain (TCP/TCP+SSL) only for now.
+    auto serving = std::make_unique<logos::plain::LpProviderDispatch>(
+        provider->moduleName, dispatch, get_methods, on_token, user_data);
+
+    bool published = false;
+    auto tryPublish = [&](std::unique_ptr<LogosTransportHost> host) {
+        if (!host) return;
+        auto* plain = dynamic_cast<logos::plain::PlainTransportHost*>(host.get());
+        if (plain && plain->publishObjectStd(name, serving.get())) {
+            published = true;
+            provider->hosts.push_back(std::move(host));
+        }
+        // else: non-plain host / publish failed — drop it (unsupported here).
+    };
+
+    const LogosTransportSet set =
+        logos::transportSetFromJsonString(provider->transportSetJson);
+    if (set.empty()) {
+        tryPublish(LogosTransportFactory::createHost(registryUrl));
+    } else {
+        for (const auto& cfg : set)
+            tryPublish(LogosTransportFactory::createHost(cfg, registryUrl));
+    }
+
+    if (!published) {
+        provider->hosts.clear();
+        return LP_ERR_UNSUPPORTED; // no plain transport to serve on
+    }
+
+    provider->serving        = std::move(serving);
+    provider->registeredName = name;
     return LP_OK;
 }
 
@@ -417,23 +479,21 @@ int lp_provider_emit_event(lp_provider* provider,
                            const char* event_name,
                            const char* data_json)
 {
-    (void)event_name;
-    (void)data_json;
-    if (!provider) return LP_ERR_INVALID_ARG;
-    // Groundwork only: serving a provider over the transports through the
-    // C ABI lands with the common cdylib module-impl ABI (module authoring
-    // phase). The registered callbacks above define the contract today.
-    return LP_ERR_UNSUPPORTED;
+    if (!provider || !event_name || !*event_name) return LP_ERR_INVALID_ARG;
+    if (!provider->serving) return LP_ERR_INTERNAL; // not registered
+    provider->serving->emitEvent(event_name, data_json ? data_json : "[]");
+    return LP_OK;
 }
 
 int lp_provider_save_token(lp_provider* provider,
                            const char* module_name,
                            const char* token)
 {
-    (void)module_name;
-    (void)token;
-    if (!provider) return LP_ERR_INVALID_ARG;
-    return LP_ERR_UNSUPPORTED;
+    if (!provider || !module_name || !*module_name || !token || !*token)
+        return LP_ERR_INVALID_ARG;
+    if (!provider->serving) return LP_ERR_INTERNAL; // not registered
+    return provider->serving->saveToken(module_name, token) ? LP_OK
+                                                            : LP_ERR_INTERNAL;
 }
 
 } // extern "C"

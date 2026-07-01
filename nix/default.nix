@@ -21,6 +21,7 @@
     pkgs.boost                # Boost.Asio for plain-C++ TCP transports
     pkgs.openssl              # TLS for TcpSsl
     pkgs.nlohmann_json        # JSON data model of the C ABI + wire codec
+    pkgs.spdlog               # logging for the Qt-free plain path
   ];
 
   # Subset of buildInputs that is safe to propagate to downstream
@@ -36,6 +37,7 @@
     pkgs.boost
     pkgs.openssl
     pkgs.nlohmann_json
+    pkgs.spdlog
   ];
 
   # Common CMake flags

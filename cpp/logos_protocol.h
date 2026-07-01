@@ -222,9 +222,24 @@ int lp_inform_module_token(lp_client* client,
                            const char* token);
 
 /* ---------------------------------------------------------------------------
- * Provider (GROUNDWORK — defined and compiled in this version, fully
- * exercised when module authoring lands on the common cdylib module-impl
- * C ABI. Until then lp_provider_register/emit return LP_ERR_UNSUPPORTED.)
+ * Provider — author a module in any language over the lp_* ABI.
+ *
+ * lp_provider_register publishes the provider on the configured PLAIN
+ * transports (TCP / TCP+SSL) so other modules can call it and receive its
+ * events. Serving is Qt-free and LOOP-FREE: incoming calls are dispatched, and
+ * events fanned out, on the protocol's own Boost.Asio I/O thread — no Qt event
+ * loop or QCoreApplication is required in the provider process. Consequently
+ * lp_dispatch_cb / lp_getmethods_cb / lp_token_cb are invoked from a protocol
+ * I/O thread; treat them as foreign-thread and keep them non-blocking.
+ *
+ * (QtRemoteObjects (LocalSocket) provider hosting is not served through this
+ * path; a non-plain transport in the set is skipped and, if none is plain,
+ * lp_provider_register returns LP_ERR_UNSUPPORTED.)
+ *
+ * Callback string ownership: strings returned by lp_dispatch_cb /
+ * lp_getmethods_cb are heap-allocated by the callback and FREED BY THE LIBRARY
+ * via lp_string_free (a plain free()), so allocate them compatibly (malloc/
+ * strdup) — mismatched allocators corrupt the heap across the FFI boundary.
  * ------------------------------------------------------------------------- */
 
 typedef struct lp_provider lp_provider;
@@ -235,7 +250,8 @@ typedef char* (*lp_dispatch_cb)(const char* method, const char* args_json,
                                 void* user_data);
 
 /** Return the module's method/event metadata as a JSON array (heap string,
- *  freed by the library via lp_string_free). */
+ *  freed by the library via lp_string_free). Each entry carries a "type" of
+ *  "method" or "event"; an entry with no "type" is treated as a method. */
 typedef char* (*lp_getmethods_cb)(void* user_data);
 
 /** Accept a token delivered by another module. Return LP_OK to accept. */

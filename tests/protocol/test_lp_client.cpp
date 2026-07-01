@@ -217,22 +217,5 @@ TEST_F(LpClientTest, TokenStoreRoundTrip)
     EXPECT_EQ(lp_token_get(nullptr), nullptr);
 }
 
-TEST_F(LpClientTest, ProviderGroundworkSurface)
-{
-    // Provider C ABI: constructible + callbacks registrable, but serving is
-    // explicitly deferred (LP_ERR_UNSUPPORTED) until module authoring lands.
-    lp_provider* provider = lp_provider_create("my_module", nullptr);
-    ASSERT_NE(provider, nullptr);
-
-    auto dispatch = [](const char*, const char*, void*) -> char* { return nullptr; };
-    EXPECT_EQ(lp_provider_register(provider, dispatch, nullptr, nullptr, nullptr),
-              LP_OK);
-    EXPECT_EQ(lp_provider_emit_event(provider, "e", "[]"), LP_ERR_UNSUPPORTED);
-    EXPECT_EQ(lp_provider_save_token(provider, "m", "t"), LP_ERR_UNSUPPORTED);
-    lp_provider_destroy(provider);
-
-    EXPECT_EQ(lp_provider_create(nullptr, nullptr), nullptr);
-    EXPECT_EQ(lp_provider_register(nullptr, dispatch, nullptr, nullptr, nullptr),
-              LP_ERR_INVALID_ARG);
-    lp_provider_destroy(nullptr);  // no-op
-}
+// The provider surface (lp_provider_*) is now functional; real serving over the
+// plain transport is covered by test_lp_provider_serving.cpp.

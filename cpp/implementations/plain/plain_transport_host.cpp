@@ -3,9 +3,13 @@
 #include "cbor_codec.h"
 #include "io_context_pool.h"
 #include "json_codec.h"
+#include "json_mapping.h"
 #include "qvariant_rpc_value.h"
 
+#include "../../lp_provider_dispatch.h"
 #include "../../module_proxy.h"
+
+#include <nlohmann/json.hpp>
 
 #include <QDebug>
 #include <QMetaObject>
@@ -298,12 +302,44 @@ bool PlainTransportHost::publishObject(const QString& name, QObject* object)
     return true;
 }
 
+bool PlainTransportHost::publishObjectStd(const QString& name, LpProviderDispatch* dispatch)
+{
+    if (!dispatch) return false;
+    std::lock_guard<std::mutex> g(m_mu);
+    const std::string stdName = name.toStdString();
+    if (m_published.count(stdName)) return false;
+
+    Published pub;
+    pub.stdDispatch = dispatch;
+
+    // Route the provider's emitted events straight to the wire fan-out. The
+    // dispatch invokes this sink from the caller's thread (never holding its
+    // own lock); fanOutEvent + the connection's Asio strand make the socket
+    // write thread-safe from any thread — no Qt signal / event loop needed.
+    dispatch->setEventSink([this, stdName](const std::string& eventName,
+                                           const std::string& dataJson) {
+        EventMessage msg;
+        msg.object    = stdName;
+        msg.eventName = eventName;
+        nlohmann::json j =
+            nlohmann::json::parse(dataJson, nullptr, /*allow_exceptions=*/false);
+        if (j.is_array()) msg.data = argsFromJson(j);
+        fanOutEvent(stdName, std::move(msg));
+    });
+
+    m_published[stdName] = std::move(pub);
+    return true;
+}
+
 void PlainTransportHost::unpublishObject(const QString& name)
 {
     std::lock_guard<std::mutex> g(m_mu);
     auto it = m_published.find(name.toStdString());
     if (it == m_published.end()) return;
-    QObject::disconnect(it->second.eventConn);
+    if (it->second.stdDispatch)
+        it->second.stdDispatch->setEventSink(nullptr); // drop our captured `this`
+    else
+        QObject::disconnect(it->second.eventConn);
     m_published.erase(it);
 }
 
@@ -329,11 +365,37 @@ void PlainTransportHost::fanOutEvent(const std::string& name, EventMessage msg)
 void PlainTransportHost::onCall(const CallMessage& req, CallReply reply)
 {
     QObject* obj = nullptr;
+    LpProviderDispatch* dispatch = nullptr;
     {
         std::lock_guard<std::mutex> g(m_mu);
         auto it = m_published.find(req.object);
-        if (it != m_published.end()) obj = it->second.object;
+        if (it != m_published.end()) { obj = it->second.object; dispatch = it->second.stdDispatch; }
     }
+
+    // Qt-free path: dispatch directly on this Asio I/O thread — no queued hop,
+    // no Qt event loop. Args/result cross the boundary as JSON (via RpcValue).
+    if (dispatch) {
+        const nlohmann::json jArgs = argsToJson(req.args);
+        bool ok = false;
+        std::string errCode;
+        const std::string resJson =
+            dispatch->callMethod(req.authToken, req.method, jArgs.dump(), &ok, &errCode);
+        ResultMessage res;
+        res.id = req.id;
+        if (ok) {
+            res.ok = true;
+            nlohmann::json jv =
+                nlohmann::json::parse(resJson, nullptr, /*allow_exceptions=*/false);
+            res.value = jv.is_discarded() ? RpcValue{std::monostate{}} : jsonToValue(jv);
+        } else {
+            res.ok = false;
+            res.err = (errCode == "UNAUTHORIZED") ? "unauthorized" : "method call failed";
+            res.errCode = errCode;
+        }
+        reply(std::move(res));
+        return;
+    }
+
     if (!obj) {
         ResultMessage res; res.id = req.id; res.ok = false;
         res.err = "object not published: " + req.object;
@@ -372,11 +434,31 @@ void PlainTransportHost::onCall(const CallMessage& req, CallReply reply)
 void PlainTransportHost::onMethods(const MethodsMessage& req, MethodsReply reply)
 {
     QObject* obj = nullptr;
+    LpProviderDispatch* dispatch = nullptr;
     {
         std::lock_guard<std::mutex> g(m_mu);
         auto it = m_published.find(req.object);
-        if (it != m_published.end()) obj = it->second.object;
+        if (it != m_published.end()) { obj = it->second.object; dispatch = it->second.stdDispatch; }
     }
+
+    // Qt-free path: the Methods query wants methods only; split the full
+    // interface JSON by the "type" tag (events ride inside getMethods).
+    if (dispatch) {
+        MethodsResultMessage res;
+        res.id = req.id;
+        res.ok = true;
+        nlohmann::json iface =
+            nlohmann::json::parse(dispatch->interfaceJson(), nullptr, /*allow_exceptions=*/false);
+        if (iface.is_array()) {
+            for (const auto& e : iface) {
+                if (e.is_object() && e.value("type", std::string("method")) == "event") continue;
+                res.methods.push_back(methodFromJson(e));
+            }
+        }
+        reply(std::move(res));
+        return;
+    }
+
     if (!obj) {
         MethodsResultMessage res; res.id = req.id; res.ok = false;
         res.err = "object not published";
@@ -445,15 +527,23 @@ void PlainTransportHost::onConnectionClosed(const void* connectionId)
 void PlainTransportHost::onToken(const TokenMessage& req)
 {
     QObject* obj = nullptr;
+    LpProviderDispatch* dispatch = nullptr;
     {
         std::lock_guard<std::mutex> g(m_mu);
         // Route token to the module matching req.moduleName if we host
         // it; otherwise the first published module (matches today's behavior
         // for the single-published-object provider pattern).
         auto it = m_published.find(req.moduleName);
-        if (it != m_published.end()) obj = it->second.object;
-        else if (!m_published.empty()) obj = m_published.begin()->second.object;
+        if (it == m_published.end() && !m_published.empty()) it = m_published.begin();
+        if (it != m_published.end()) { obj = it->second.object; dispatch = it->second.stdDispatch; }
     }
+
+    // Qt-free path: register the inbound token directly (no QObject invoke).
+    if (dispatch) {
+        dispatch->informModuleToken(req.authToken, req.moduleName, req.token);
+        return;
+    }
+
     if (!obj) return;
     QString authToken  = QString::fromStdString(req.authToken);
     QString moduleName = QString::fromStdString(req.moduleName);

@@ -17,6 +17,9 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Core RemoteObjects)
 find_package(Boost REQUIRED COMPONENTS system)
 find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json REQUIRED)
+# spdlog — logging for the Qt-free plain path (never QDebug), matching the rest
+# of the workspace (logos-liblogos et al.).
+find_package(spdlog REQUIRED)
 
 set(PROTOCOL_SOURCES
     logos_protocol.h
@@ -31,6 +34,8 @@ set(PROTOCOL_SOURCES
     logos_api_consumer.h
     module_proxy.cpp
     module_proxy.h
+    lp_provider_dispatch.cpp
+    lp_provider_dispatch.h
     token_manager.cpp
     token_manager.h
     logos_mode.h
@@ -106,6 +111,7 @@ target_link_libraries(logos_protocol PUBLIC
     OpenSSL::SSL
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
+    spdlog::spdlog
 )
 
 target_include_directories(logos_protocol PUBLIC

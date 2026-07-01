@@ -16,13 +16,19 @@
 
 namespace logos::plain {
 
+class LpProviderDispatch;
+
 // -----------------------------------------------------------------------------
-// PlainTransportHost — publishes QObjects over plain-C++ TCP or TCP+SSL.
+// PlainTransportHost — publishes providers over plain-C++ TCP or TCP+SSL.
 //
-// Owns an RpcServer (TCP or SSL variant), an IWireCodec (per config), and
-// a registry mapping object name → published QObject. For each object it
-// hooks into the QObject's `eventResponse(QString, QVariantList)` Qt signal
-// so emitted events fan out to every subscribed RPC connection.
+// Owns an RpcServer (TCP or SSL variant), an IWireCodec (per config), and a
+// registry mapping object name → published provider. It serves two kinds of
+// provider:
+//   * a Qt ModuleProxy (QObject), via publishObject(name, QObject*) — dispatch
+//     is queued to the proxy's thread (needs a Qt event loop; the QtRO path).
+//   * a Qt-free LpProviderDispatch, via publishObjectStd(name, dispatch) —
+//     dispatch runs DIRECTLY on the Asio I/O thread (no QObject, no loop).
+// Events fan out to every subscribed RPC connection either way.
 // -----------------------------------------------------------------------------
 class PlainTransportHost
     : public LogosTransportHost
@@ -35,6 +41,13 @@ public:
     // LogosTransportHost
     bool publishObject(const QString& name, QObject* object) override;
     void unpublishObject(const QString& name) override;
+
+    // Qt-free provider publish: serves an LpProviderDispatch directly on the
+    // Asio I/O thread (no QObject/ModuleProxy, no Qt event loop). The dispatch
+    // is owned by the caller and must outlive the publication (unpublish clears
+    // the host's event sink into it). Returns false if a name is already published.
+    bool publishObjectStd(const QString& name, LpProviderDispatch* dispatch);
+
     QString bindUrl(const QString& instanceId,
                     const QString& moduleName) override;
 
@@ -62,10 +75,13 @@ public:
 
 private:
     struct Published {
+        // Exactly one of these is set. `object` = the legacy Qt ModuleProxy
+        // path; `stdDispatch` = the Qt-free LpProviderDispatch path.
         QObject* object = nullptr;
+        LpProviderDispatch* stdDispatch = nullptr;
         // Tracked event subscribers per event name (including "" wildcard).
         std::map<std::string, std::map<const void*, EventSink>> sinksByEvent;
-        QMetaObject::Connection eventConn;
+        QMetaObject::Connection eventConn; // only used for the QObject path
     };
 
     LogosTransportConfig                    m_cfg;

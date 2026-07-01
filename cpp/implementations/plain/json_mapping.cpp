@@ -93,8 +93,11 @@ std::vector<uint8_t> b64url_decode(const std::string& s)
     return out;
 }
 
-json valueToJson(const RpcValue& v);
-RpcValue jsonToValue(const json& j);
+} // anonymous namespace (file-local base64 helpers)
+
+// The RpcValue<->json + MethodMetadata converters below have external linkage
+// (declared in json_mapping.h) so the Qt-free plain provider/consumer paths can
+// reuse them. They still call the anon base64 helpers (same TU).
 
 json valueToJson(const RpcValue& v)
 {
@@ -195,8 +198,6 @@ std::vector<RpcValue> argsFromJson(const json& j)
     }
     return out;
 }
-
-} // anonymous namespace
 
 // ── Public entry points ────────────────────────────────────────────────────
 
