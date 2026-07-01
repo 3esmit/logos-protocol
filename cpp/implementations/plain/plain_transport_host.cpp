@@ -206,17 +206,20 @@ PlainTransportHost::~PlainTransportHost()
     decltype(m_published) published;
     decltype(m_tcp) tcp;
     decltype(m_ssl) ssl;
+    decltype(m_unix) unix;
     {
         std::lock_guard<std::mutex> g(m_mu);
         published = std::move(m_published);
         tcp = std::move(m_tcp);
         ssl = std::move(m_ssl);
+        unix = std::move(m_unix);
     }
     for (auto& [name, pub] : published) {
         QObject::disconnect(pub.eventConn);
     }
-    if (tcp) tcp->stop();
-    if (ssl) ssl->stop();
+    if (tcp)  tcp->stop();
+    if (ssl)  ssl->stop();
+    if (unix) unix->stop();
 
     // Quiesce the I/O thread before this host (an IncomingCallHandler) is
     // destroyed. Server-side RpcConnections hold a RAW `IncomingCallHandler*`
@@ -230,7 +233,7 @@ PlainTransportHost::~PlainTransportHost()
     // handler has completed; blocking on it guarantees no callback still
     // references this host. Skip when we're ON the I/O thread (the in-flight
     // handler is our own caller) to avoid self-deadlock.
-    if (tcp || ssl) {
+    if (tcp || ssl || unix) {
         auto& ioc = IoContextPool::shared().ioContext();
         if (!ioc.get_executor().running_in_this_thread()) {
             std::promise<void> drained;
@@ -272,6 +275,15 @@ bool PlainTransportHost::start()
             qCritical() << "PlainTransportHost: SSL context setup failed:" << e.what();
             return false;
         }
+    } else if (m_cfg.protocol == LogosProtocol::PlainLocal) {
+        m_unix = std::make_shared<RpcServerUnix>(ioc, m_cfg.socketPath, codec, this);
+        if (!m_unix->start()) {
+            qCritical() << "PlainTransportHost: Unix-socket bind failed on"
+                        << QString::fromStdString(m_cfg.socketPath);
+            m_unix.reset();
+            return false;
+        }
+        m_boundSocketPath = m_cfg.socketPath;
     } else {
         qCritical() << "PlainTransportHost: unsupported protocol";
         return false;
@@ -283,6 +295,8 @@ bool PlainTransportHost::start()
 QString PlainTransportHost::endpoint() const
 {
     std::lock_guard<std::mutex> g(m_mu);
+    if (!m_boundSocketPath.empty())
+        return QString("unix://%1").arg(QString::fromStdString(m_boundSocketPath));
     if (m_boundPort == 0) return QString();
     return QString("tcp://%1:%2")
         .arg(QString::fromStdString(m_cfg.host))

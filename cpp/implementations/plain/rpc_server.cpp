@@ -5,6 +5,8 @@
 #include <QDebug>
 
 #include <algorithm>
+#include <filesystem>
+#include <system_error>
 
 namespace logos::plain {
 
@@ -189,6 +191,102 @@ void RpcServerSsl::doAccept()
                     });
                     conn->start();
                 });
+            self->doAccept();
+        });
+}
+
+// ── RpcServerUnix ─────────────────────────────────────────────────────────
+
+RpcServerUnix::RpcServerUnix(boost::asio::io_context& ioc,
+                             const std::string& socketPath,
+                             std::shared_ptr<IWireCodec> codec,
+                             IncomingCallHandler* handler)
+    : m_acceptor(ioc)
+    , m_codec(std::move(codec))
+    , m_handler(handler)
+    , m_socketPath(socketPath)
+{
+}
+
+bool RpcServerUnix::start()
+{
+    if (m_socketPath.empty()) return false;
+
+    // A Unix socket file left by a previous (crashed) run makes bind() fail
+    // with EADDRINUSE. Remove any stale file first; ignore ENOENT etc.
+    std::error_code fsec;
+    std::filesystem::remove(m_socketPath, fsec);
+
+    boost::system::error_code ec;
+    boost::asio::local::stream_protocol::endpoint ep(m_socketPath);
+    m_acceptor.open(ep.protocol(), ec);          if (ec) return false;
+    // bind() materializes the socket file on disk. If a later step fails, clean
+    // it up ourselves rather than leaving an orphan for the next start() to
+    // unlink (stop() only removes the file once we've fully bound).
+    m_acceptor.bind(ep, ec);                     if (ec) return false;
+    m_acceptor.listen(boost::asio::socket_base::max_listen_connections, ec);
+    if (ec) {
+        boost::system::error_code ignore;
+        m_acceptor.close(ignore);
+        std::error_code fsec;
+        std::filesystem::remove(m_socketPath, fsec);
+        return false;
+    }
+
+    m_bound = true;
+    doAccept();
+    return true;
+}
+
+void RpcServerUnix::stop()
+{
+    // Same shape as RpcServerTcp::stop — release m_mu before stopping
+    // connections so the per-connection error handler (which re-locks m_mu)
+    // can't self-deadlock.
+    std::vector<std::shared_ptr<UnixConnection>> conns;
+    bool wasBound = false;
+    {
+        std::lock_guard<std::mutex> g(m_mu);
+        m_stopped = true;
+        boost::system::error_code ignore;
+        m_acceptor.close(ignore);
+        conns.swap(m_conns);
+        wasBound = m_bound;
+        m_bound = false;
+    }
+    for (auto& c : conns) c->stop("server stopped");
+
+    // Remove the socket file we created so the path is clean for a future bind.
+    if (wasBound && !m_socketPath.empty()) {
+        std::error_code fsec;
+        std::filesystem::remove(m_socketPath, fsec);
+    }
+}
+
+void RpcServerUnix::doAccept()
+{
+    auto self = shared_from_this();
+    m_acceptor.async_accept(
+        [self](const boost::system::error_code& ec,
+               boost::asio::local::stream_protocol::socket socket) {
+            if (ec) return;  // acceptor probably closed; quietly exit.
+            auto conn = std::make_shared<UnixConnection>(
+                std::move(socket), self->m_codec, self->m_handler);
+            {
+                std::lock_guard<std::mutex> g(self->m_mu);
+                if (self->m_stopped) { conn->stop("server stopped"); return; }
+                self->m_conns.push_back(conn);
+            }
+            std::weak_ptr<RpcServerUnix> weakSelf = self;
+            conn->setErrorHandler([weakSelf, conn](const std::string&) {
+                auto s = weakSelf.lock();
+                if (!s) return;
+                std::lock_guard<std::mutex> g(s->m_mu);
+                s->m_conns.erase(
+                    std::remove(s->m_conns.begin(), s->m_conns.end(), conn),
+                    s->m_conns.end());
+            });
+            conn->start();
             self->doAccept();
         });
 }

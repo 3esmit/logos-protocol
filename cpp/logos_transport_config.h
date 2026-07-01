@@ -15,9 +15,11 @@
 // -----------------------------------------------------------------------------
 
 enum class LogosProtocol {
-    LocalSocket,   // QLocalSocket via QRemoteObjects (existing code path)
+    LocalSocket,   // QLocalSocket via QRemoteObjects (existing code path — the DEFAULT, unchanged)
     Tcp,           // Plain TCP (Boost.Asio + JSON framing)
     TcpSsl,        // TCP + TLS (Boost.Asio + OpenSSL + JSON framing)
+    PlainLocal,    // Plain Unix-domain socket (Boost.Asio + framing) — the Qt-free
+                   // local transport, SEPARATE from the QtRO LocalSocket above.
     // Noise, Quic — future work
 };
 
@@ -45,9 +47,14 @@ struct LogosTransportConfig {
     std::string keyFile;
     bool verifyPeer = true;
 
+    // PlainLocal only: filesystem path of the Unix-domain socket to bind
+    // (daemon) / connect (client). No host/port apply. Keep it short — the OS
+    // caps sun_path (~104 bytes on macOS, ~108 on Linux).
+    std::string socketPath;
+
     // Wire-format codec used for RPC framing on this transport. Only
-    // meaningful for plain-C++ transports (Tcp / TcpSsl); LocalSocket
-    // ignores it and uses QRemoteObjects' own wire format.
+    // meaningful for plain-C++ transports (Tcp / TcpSsl / PlainLocal);
+    // LocalSocket ignores it and uses QRemoteObjects' own wire format.
     LogosWireCodec codec = LogosWireCodec::Json;
 };
 
@@ -65,6 +72,7 @@ inline bool operator==(const LogosTransportConfig& a,
         && a.verifyPeer == b.verifyPeer
         && a.codec      == b.codec
         && a.host       == b.host
+        && a.socketPath == b.socketPath
         && a.caFile     == b.caFile
         && a.certFile   == b.certFile
         && a.keyFile    == b.keyFile;

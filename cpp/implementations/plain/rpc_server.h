@@ -6,6 +6,7 @@
 #include "wire_codec.h"
 
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/local/stream_protocol.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/stream.hpp>
 
@@ -97,6 +98,47 @@ private:
 
     std::mutex                                    m_mu;
     std::vector<std::shared_ptr<SslConnection>>   m_conns;
+    bool                                          m_stopped = false;
+};
+
+// -----------------------------------------------------------------------------
+// RpcServer (Unix domain socket) — same accept/dispatch shape as RpcServerTcp,
+// but bound to a filesystem path instead of host:port. There is no port and no
+// TLS (a Unix socket is already local + kernel-enforced by file permissions).
+// RpcConnection<Stream> is generic over the Asio stream, so the connection code
+// is reused verbatim for the local::stream_protocol::socket.
+// -----------------------------------------------------------------------------
+
+using UnixStream = boost::asio::local::stream_protocol::socket;
+using UnixConnection = RpcConnection<UnixStream>;
+
+class RpcServerUnix : public std::enable_shared_from_this<RpcServerUnix> {
+public:
+    RpcServerUnix(boost::asio::io_context& ioc,
+                  const std::string& socketPath,
+                  std::shared_ptr<IWireCodec> codec,
+                  IncomingCallHandler* handler);
+
+    // Start accepting. Unlinks any stale socket file at the path first; returns
+    // false if the path is empty or bind/listen fails.
+    bool start();
+
+    // The bound socket path (empty until start() succeeds).
+    const std::string& socketPath() const { return m_socketPath; }
+
+    void stop();
+
+private:
+    void doAccept();
+
+    boost::asio::local::stream_protocol::acceptor m_acceptor;
+    std::shared_ptr<IWireCodec>       m_codec;
+    IncomingCallHandler*              m_handler;
+    std::string                       m_socketPath;
+    bool                              m_bound = false;
+
+    std::mutex                                    m_mu;
+    std::vector<std::shared_ptr<UnixConnection>>  m_conns;
     bool                                          m_stopped = false;
 };
 

@@ -10,6 +10,7 @@
 
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/local/stream_protocol.hpp>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/host_name_verification.hpp>
 #include <boost/asio/ssl/stream.hpp>
@@ -63,6 +64,20 @@ bool PlainTransportConnection::connectToHost()
     auto codec = makeCodec(m_cfg.codec);
 
     try {
+        if (m_cfg.protocol == LogosProtocol::PlainLocal) {
+            // Unix-domain socket: connect directly to the filesystem path — no
+            // DNS resolver, no host/port. Reuses RpcConnection<Stream> verbatim.
+            boost::asio::local::stream_protocol::socket socket(ioc);
+            socket.connect(
+                boost::asio::local::stream_protocol::endpoint(m_cfg.socketPath));
+            auto conn = std::make_shared<UnixConnection>(
+                std::move(socket), codec, nullptr);
+            conn->start();
+            m_conn = conn;
+            m_connected = true;
+            return true;
+        }
+
         boost::asio::ip::tcp::resolver resolver(ioc);
         auto endpoints = resolver.resolve(m_cfg.host, std::to_string(m_cfg.port));
 
@@ -140,6 +155,8 @@ LogosObject* PlainTransportConnection::requestObject(const QString& objectName, 
 QString PlainTransportConnection::endpointUrl(const QString& /*instanceId*/,
                                               const QString& /*moduleName*/)
 {
+    if (m_cfg.protocol == LogosProtocol::PlainLocal)
+        return QString("unix://%1").arg(QString::fromStdString(m_cfg.socketPath));
     return QString("tcp://%1:%2")
         .arg(QString::fromStdString(m_cfg.host))
         .arg(m_cfg.port);

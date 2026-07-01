@@ -14,14 +14,16 @@ const char* protocolToString(LogosProtocol p)
     case LogosProtocol::LocalSocket: return "local";
     case LogosProtocol::Tcp:         return "tcp";
     case LogosProtocol::TcpSsl:      return "tcp_ssl";
+    case LogosProtocol::PlainLocal:  return "plain_local";
     }
     return "local";
 }
 
 LogosProtocol protocolFromString(const std::string& s)
 {
-    if (s == "tcp")     return LogosProtocol::Tcp;
-    if (s == "tcp_ssl") return LogosProtocol::TcpSsl;
+    if (s == "tcp")         return LogosProtocol::Tcp;
+    if (s == "tcp_ssl")     return LogosProtocol::TcpSsl;
+    if (s == "plain_local") return LogosProtocol::PlainLocal;
     return LogosProtocol::LocalSocket;
 }
 
@@ -48,10 +50,15 @@ std::string transportSetToJsonString(const LogosTransportSet& set)
     for (const auto& cfg : set) {
         json o;
         o["protocol"] = protocolToString(cfg.protocol);
-        if (cfg.protocol != LogosProtocol::LocalSocket) {
+        if (cfg.protocol == LogosProtocol::Tcp
+            || cfg.protocol == LogosProtocol::TcpSsl) {
             o["host"]  = cfg.host;
             o["port"]  = cfg.port;
             o["codec"] = codecToString(cfg.codec);
+        }
+        if (cfg.protocol == LogosProtocol::PlainLocal) {
+            o["socket_path"] = cfg.socketPath;
+            o["codec"]       = codecToString(cfg.codec);
         }
         if (cfg.protocol == LogosProtocol::TcpSsl) {
             // Cert/key paths intentionally included — this serialization
@@ -85,10 +92,18 @@ LogosTransportSet transportSetFromJsonString(const std::string& jsonStr)
         LogosTransportConfig cfg;
         cfg.protocol = protocolFromString(o.value("protocol", std::string{"local"}));
         cfg.host = o.value("host", std::string{"127.0.0.1"});
-        const int rawPort = o.value("port", 0);
-        if (rawPort < 0 || rawPort > 0xFFFF) continue;
-        cfg.port = static_cast<uint16_t>(rawPort);
+        // `port` is only meaningful for the TCP transports. Validating it for
+        // every protocol would silently DROP an otherwise-valid plain_local (or
+        // local) entry that happens to carry a stray out-of-range "port" key —
+        // so gate the range check on the protocols that actually use it.
+        if (cfg.protocol == LogosProtocol::Tcp
+            || cfg.protocol == LogosProtocol::TcpSsl) {
+            const int rawPort = o.value("port", 0);
+            if (rawPort < 0 || rawPort > 0xFFFF) continue;
+            cfg.port = static_cast<uint16_t>(rawPort);
+        }
         cfg.codec = codecFromString(o.value("codec", std::string{"json"}));
+        cfg.socketPath = o.value("socket_path", std::string{});
         cfg.caFile   = o.value("ca_file",   std::string{});
         cfg.certFile = o.value("cert_file", std::string{});
         cfg.keyFile  = o.value("key_file",  std::string{});

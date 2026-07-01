@@ -220,13 +220,15 @@ lp_client* lp_client_create(const char* target_module,
     handle->guard = std::make_shared<CbGuard>();
 
     // Qt-free plain path: in Remote mode over a plain wire protocol (TCP /
-    // TCP+SSL) build an LpPlainClient — no QObject, no QCoreApplication, no Qt
-    // event loop. Any other mode/protocol (QtRO LocalSocket, Local, Mock) keeps
+    // TCP+SSL / plain-local Unix socket) build an LpPlainClient — no QObject, no
+    // QCoreApplication, no Qt event loop. Any other mode/protocol (QtRO
+    // LocalSocket, Local, Mock) keeps
     // the LogosAPIClient path unchanged. Local/Mock ignore cfg.protocol, so we
     // must gate on isRemote() too or we'd hijack those in-process transports.
     const bool plainWire = LogosModeConfig::isRemote()
         && (targetCfg.protocol == LogosProtocol::Tcp
-            || targetCfg.protocol == LogosProtocol::TcpSsl);
+            || targetCfg.protocol == LogosProtocol::TcpSsl
+            || targetCfg.protocol == LogosProtocol::PlainLocal);
 
     if (plainWire) {
         handle->plain = logos::plain::LpPlainClient::create(

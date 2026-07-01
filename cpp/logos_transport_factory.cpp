@@ -34,7 +34,8 @@ createHost(const LogosTransportConfig& cfg, const QString& registryUrl)
     }
     switch (cfg.protocol) {
     case LogosProtocol::Tcp:
-    case LogosProtocol::TcpSsl: {
+    case LogosProtocol::TcpSsl:
+    case LogosProtocol::PlainLocal: {
         auto host = std::make_unique<logos::plain::PlainTransportHost>(cfg);
         if (!host->start()) {
             qCritical() << "LogosTransportFactory: PlainTransportHost::start() failed";
@@ -66,6 +67,7 @@ createConnection(const LogosTransportConfig& cfg, const QString& registryUrl)
     switch (cfg.protocol) {
     case LogosProtocol::Tcp:
     case LogosProtocol::TcpSsl:
+    case LogosProtocol::PlainLocal:
         return std::make_unique<logos::plain::PlainTransportConnection>(cfg);
     case LogosProtocol::LocalSocket:
     default:

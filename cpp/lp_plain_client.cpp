@@ -30,7 +30,8 @@ const std::string kCompleteEvent  = logos::callCompleteEvent().toStdString();
 bool isPlainProtocol(const LogosTransportConfig& cfg)
 {
     return cfg.protocol == LogosProtocol::Tcp
-        || cfg.protocol == LogosProtocol::TcpSsl;
+        || cfg.protocol == LogosProtocol::TcpSsl
+        || cfg.protocol == LogosProtocol::PlainLocal;
 }
 
 int effectiveTimeout(int timeoutMs)

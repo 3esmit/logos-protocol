@@ -88,9 +88,12 @@ private:
     };
 
     LogosTransportConfig                    m_cfg;
+    // Exactly one server is set, per m_cfg.protocol.
     std::shared_ptr<RpcServerTcp>           m_tcp;
     std::shared_ptr<RpcServerSsl>           m_ssl;
-    uint16_t                                m_boundPort = 0;
+    std::shared_ptr<RpcServerUnix>          m_unix;
+    uint16_t                                m_boundPort = 0;       // Tcp / TcpSsl
+    std::string                             m_boundSocketPath;     // PlainLocal
 
     mutable std::mutex                      m_mu;
     std::map<std::string, Published>        m_published;
