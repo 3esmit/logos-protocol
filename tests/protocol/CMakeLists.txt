@@ -54,3 +54,11 @@ target_link_libraries(protocol_tests PRIVATE
 )
 
 gtest_discover_tests(protocol_tests)
+
+# Phase-4 invariant guard: the Qt-free plain wire path must stay free of the
+# QVariant boundary and QDebug. A source grep, run as a CTest so a regression
+# fails CI rather than silently re-Qt-ing the loop-free path.
+add_test(NAME QtFreePlainPathGuard
+    COMMAND ${CMAKE_COMMAND}
+        -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../../cpp
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/check_qtfree_plain.cmake)

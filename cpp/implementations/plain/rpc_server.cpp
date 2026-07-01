@@ -2,7 +2,7 @@
 
 #include <boost/asio/ip/address.hpp>
 
-#include <QDebug>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -162,10 +162,8 @@ void RpcServerSsl::doAccept()
                         // is unavailable, or the listener picked a
                         // version the client refuses). Category + code
                         // + message give enough to grep for.
-                        qWarning().nospace()
-                            << "RpcServerSsl: TLS handshake failed: "
-                            << hs.category().name() << ':' << hs.value()
-                            << " (" << QString::fromStdString(hs.message()) << ")";
+                        spdlog::warn("RpcServerSsl: TLS handshake failed: {}:{} ({})",
+                                     hs.category().name(), hs.value(), hs.message());
                         return;
                     }
                     // Hand the SslStream off to a connection that owns

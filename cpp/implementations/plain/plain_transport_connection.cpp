@@ -6,7 +6,7 @@
 #include "plain_logos_object.h"
 #include "rpc_server.h"
 
-#include <QDebug>
+#include <spdlog/spdlog.h>
 
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -103,7 +103,7 @@ bool PlainTransportConnection::connectToHost()
             // SNI configuration at the wrapper level.
             if (!SSL_set_tlsext_host_name(stream.native_handle(),
                                           m_cfg.host.c_str())) {
-                qWarning() << "PlainTransportConnection: SSL_set_tlsext_host_name failed";
+                spdlog::warn("PlainTransportConnection: SSL_set_tlsext_host_name failed");
             }
             // Verify the peer's certificate name matches the host we
             // dialed when verifyPeer is on. verify_peer alone only
@@ -124,10 +124,10 @@ bool PlainTransportConnection::connectToHost()
             return true;
         }
 
-        qCritical() << "PlainTransportConnection: unsupported protocol";
+        spdlog::error("PlainTransportConnection: unsupported protocol");
         return false;
     } catch (const std::exception& e) {
-        qWarning() << "PlainTransportConnection::connectToHost failed:" << e.what();
+        spdlog::warn("PlainTransportConnection::connectToHost failed: {}", e.what());
         m_connected = false;
         return false;
     }

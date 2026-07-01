@@ -11,7 +11,9 @@
 
 #include <nlohmann/json.hpp>
 
-#include <QDebug>
+#include <spdlog/spdlog.h>
+
+#include <QObject>
 #include <QMetaObject>
 
 #include <atomic>
@@ -40,7 +42,7 @@ std::shared_ptr<IWireCodec> makeCodec(LogosWireCodec kind)
     }
 }
 
-// Print the last OpenSSL error to qWarning, clearing the error stack.
+// Log the last OpenSSL error via spdlog, clearing the error stack.
 // Used after any SSL_CTX_set_* call that returned 0 — silent failures
 // were how we missed the cipher-list misconfig for multiple rounds.
 void dumpSslErrors(const char* where)
@@ -49,7 +51,7 @@ void dumpSslErrors(const char* where)
     while ((e = ERR_get_error()) != 0) {
         char buf[256];
         ERR_error_string_n(e, buf, sizeof(buf));
-        qWarning() << "buildSslCtx/" << where << ":" << buf;
+        spdlog::warn("buildSslCtx/{}: {}", where, buf);
     }
 }
 
@@ -64,22 +66,16 @@ boost::asio::ssl::context buildSslCtx(const LogosTransportConfig& cfg, bool serv
     static bool versionsLogged = false;
     if (!versionsLogged) {
         versionsLogged = true;
-        qInfo().nospace()
-            << "buildSslCtx versions: "
-            << "Boost build=" << BOOST_VERSION
-            << " (" << BOOST_LIB_VERSION << "), "
-            << "OpenSSL build=0x" << Qt::hex << OPENSSL_VERSION_NUMBER
-            << Qt::dec << " (" << OPENSSL_VERSION_TEXT << "), "
-            << "runtime=" << OpenSSL_version(OPENSSL_VERSION);
+        spdlog::info("buildSslCtx versions: Boost build={} ({}), "
+                     "OpenSSL build=0x{:x} ({}), runtime={}",
+                     BOOST_VERSION, BOOST_LIB_VERSION,
+                     OPENSSL_VERSION_NUMBER, OPENSSL_VERSION_TEXT,
+                     OpenSSL_version(OPENSSL_VERSION));
     }
 
-    qInfo().nospace() << "buildSslCtx: cfg.certFile='"
-        << QString::fromStdString(cfg.certFile)
-        << "' cfg.keyFile='"
-        << QString::fromStdString(cfg.keyFile)
-        << "' cfg.caFile='"
-        << QString::fromStdString(cfg.caFile)
-        << "' role=" << (server ? "server" : "client");
+    spdlog::info("buildSslCtx: cfg.certFile='{}' cfg.keyFile='{}' cfg.caFile='{}' role={}",
+                 cfg.certFile, cfg.keyFile, cfg.caFile,
+                 server ? "server" : "client");
 
     boost::asio::ssl::context ctx(server
         ? boost::asio::ssl::context::tls_server
@@ -93,30 +89,30 @@ boost::asio::ssl::context buildSslCtx(const LogosTransportConfig& cfg, bool serv
     // dump any pending OpenSSL errors — previous silent-fail behaviour
     // was the root cause of multiple debugging rounds landing no fix.
     if (!SSL_CTX_set_min_proto_version(ctx.native_handle(), TLS1_2_VERSION)) {
-        qWarning() << "buildSslCtx: SSL_CTX_set_min_proto_version(TLS1_2) failed";
+        spdlog::warn("buildSslCtx: SSL_CTX_set_min_proto_version(TLS1_2) failed");
         dumpSslErrors("set_min_proto_version");
     }
     if (!SSL_CTX_set_max_proto_version(ctx.native_handle(), TLS1_3_VERSION)) {
-        qWarning() << "buildSslCtx: SSL_CTX_set_max_proto_version(TLS1_3) failed";
+        spdlog::warn("buildSslCtx: SSL_CTX_set_max_proto_version(TLS1_3) failed");
         dumpSslErrors("set_max_proto_version");
     }
     if (!SSL_CTX_set1_groups_list(ctx.native_handle(),
                                   "X25519:P-256:P-384:P-521")) {
-        qWarning() << "buildSslCtx: SSL_CTX_set1_groups_list failed";
+        spdlog::warn("buildSslCtx: SSL_CTX_set1_groups_list failed");
         dumpSslErrors("set1_groups_list");
     }
     if (!SSL_CTX_set_ciphersuites(ctx.native_handle(),
             "TLS_AES_128_GCM_SHA256:"
             "TLS_AES_256_GCM_SHA384:"
             "TLS_CHACHA20_POLY1305_SHA256")) {
-        qWarning() << "buildSslCtx: SSL_CTX_set_ciphersuites failed";
+        spdlog::warn("buildSslCtx: SSL_CTX_set_ciphersuites failed");
         dumpSslErrors("set_ciphersuites");
     }
     if (!SSL_CTX_set_cipher_list(ctx.native_handle(),
             "ECDHE+AESGCM:ECDHE+CHACHA20:"
             "DHE+AESGCM:DHE+CHACHA20:"
             "!aNULL:!MD5:!DSS:!RC4:!3DES")) {
-        qWarning() << "buildSslCtx: SSL_CTX_set_cipher_list failed";
+        spdlog::warn("buildSslCtx: SSL_CTX_set_cipher_list failed");
         dumpSslErrors("set_cipher_list");
     }
 
@@ -128,22 +124,18 @@ boost::asio::ssl::context buildSslCtx(const LogosTransportConfig& cfg, bool serv
     {
         auto* sk = SSL_CTX_get_ciphers(ctx.native_handle());
         const int n = sk ? sk_SSL_CIPHER_num(sk) : 0;
-        QString first;
+        std::string first;
         if (n > 0) {
             const SSL_CIPHER* c = sk_SSL_CIPHER_value(sk, 0);
-            first = QString::fromLatin1(SSL_CIPHER_get_name(c));
+            first = SSL_CIPHER_get_name(c);
         }
-        qInfo().nospace() << "buildSslCtx: role="
-            << (server ? "server" : "client")
-            << " min_proto=0x" << Qt::hex
-            << SSL_CTX_get_min_proto_version(ctx.native_handle())
-            << " max_proto=0x"
-            << SSL_CTX_get_max_proto_version(ctx.native_handle())
-            << " options=0x"
-            << SSL_CTX_get_options(ctx.native_handle())
-            << Qt::dec
-            << " cipher_count=" << n
-            << " first_cipher=" << first;
+        spdlog::info("buildSslCtx: role={} min_proto=0x{:x} max_proto=0x{:x} "
+                     "options=0x{:x} cipher_count={} first_cipher={}",
+                     server ? "server" : "client",
+                     SSL_CTX_get_min_proto_version(ctx.native_handle()),
+                     SSL_CTX_get_max_proto_version(ctx.native_handle()),
+                     SSL_CTX_get_options(ctx.native_handle()),
+                     n, first);
     }
 
     if (!cfg.certFile.empty()) {
@@ -175,10 +167,8 @@ boost::asio::ssl::context buildSslCtx(const LogosTransportConfig& cfg, bool serv
         X509* serverCert = SSL_CTX_get0_certificate(ctx.native_handle());
         EVP_PKEY* serverKey = SSL_CTX_get0_privatekey(ctx.native_handle());
         const int checkOk = SSL_CTX_check_private_key(ctx.native_handle());
-        qInfo().nospace() << "buildSslCtx: cert_attached="
-            << (serverCert ? "yes" : "no")
-            << " key_attached=" << (serverKey ? "yes" : "no")
-            << " check_private_key=" << checkOk;
+        spdlog::info("buildSslCtx: cert_attached={} key_attached={} check_private_key={}",
+                     serverCert ? "yes" : "no", serverKey ? "yes" : "no", checkOk);
         if (!checkOk) dumpSslErrors("SSL_CTX_check_private_key");
     }
     return ctx;
@@ -254,8 +244,8 @@ bool PlainTransportHost::start()
     if (m_cfg.protocol == LogosProtocol::Tcp) {
         m_tcp = std::make_shared<RpcServerTcp>(ioc, m_cfg.host, m_cfg.port, codec, this);
         if (!m_tcp->start()) {
-            qCritical() << "PlainTransportHost: TCP bind failed on"
-                        << QString::fromStdString(m_cfg.host) << m_cfg.port;
+            spdlog::error("PlainTransportHost: TCP bind failed on {}:{}",
+                          m_cfg.host, m_cfg.port);
             m_tcp.reset();
             return false;
         }
@@ -266,26 +256,26 @@ bool PlainTransportHost::start()
             m_ssl = std::make_shared<RpcServerSsl>(ioc, m_cfg.host, m_cfg.port,
                                                    std::move(ctx), codec, this);
             if (!m_ssl->start()) {
-                qCritical() << "PlainTransportHost: TLS bind failed";
+                spdlog::error("PlainTransportHost: TLS bind failed");
                 m_ssl.reset();
                 return false;
             }
             m_boundPort = m_ssl->boundPort();
         } catch (const std::exception& e) {
-            qCritical() << "PlainTransportHost: SSL context setup failed:" << e.what();
+            spdlog::error("PlainTransportHost: SSL context setup failed: {}", e.what());
             return false;
         }
     } else if (m_cfg.protocol == LogosProtocol::PlainLocal) {
         m_unix = std::make_shared<RpcServerUnix>(ioc, m_cfg.socketPath, codec, this);
         if (!m_unix->start()) {
-            qCritical() << "PlainTransportHost: Unix-socket bind failed on"
-                        << QString::fromStdString(m_cfg.socketPath);
+            spdlog::error("PlainTransportHost: Unix-socket bind failed on {}",
+                          m_cfg.socketPath);
             m_unix.reset();
             return false;
         }
         m_boundSocketPath = m_cfg.socketPath;
     } else {
-        qCritical() << "PlainTransportHost: unsupported protocol";
+        spdlog::error("PlainTransportHost: unsupported protocol");
         return false;
     }
     m_started = true;
@@ -316,8 +306,9 @@ bool PlainTransportHost::publishObject(const QString& name, QObject* object)
     if (!object) return false;
     auto* proxy = qobject_cast<ModuleProxy*>(object);
     if (!proxy) {
-        qWarning() << "PlainTransportHost::publishObject: expected ModuleProxy for"
-                   << name << "(plain transport only publishes ModuleProxy for now)";
+        spdlog::warn("PlainTransportHost::publishObject: expected ModuleProxy for "
+                     "{} (plain transport only publishes ModuleProxy for now)",
+                     name.toStdString());
         return false;
     }
 
