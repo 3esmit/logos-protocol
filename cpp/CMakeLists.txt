@@ -164,6 +164,48 @@ install(FILES
     DESTINATION lib/cmake/logos-protocol
 )
 
+# -----------------------------------------------------------------------------
+# Optional shared variant — a dlopen-able liblogos_protocol.{so,dylib} exposing
+# the lp_* C ABI. Consumers that STATICALLY link (cpp-sdk, modules,
+# module-client) use the archive above and never need this; FFI/dlopen SDKs
+# (js-sdk via koffi, or any language runtime loading the C ABI) load this shared
+# object instead. OFF by default so the common static-lib builds don't pay the
+# double compile; the shared nix package flips it ON.
+# -----------------------------------------------------------------------------
+option(LOGOS_PROTOCOL_BUILD_SHARED
+       "Also build a shared liblogos_protocol for dlopen/FFI consumers" OFF)
+
+if(LOGOS_PROTOCOL_BUILD_SHARED)
+    add_library(logos_protocol_shared SHARED ${PROTOCOL_SOURCES})
+    set_target_properties(logos_protocol_shared PROPERTIES
+        OUTPUT_NAME logos_protocol
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib"
+    )
+    target_link_libraries(logos_protocol_shared PUBLIC
+        Qt${QT_VERSION_MAJOR}::Core
+        Qt${QT_VERSION_MAJOR}::RemoteObjects
+        Boost::headers
+        Boost::system
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        nlohmann_json::nlohmann_json
+        spdlog::spdlog
+    )
+    target_include_directories(logos_protocol_shared PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_local>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/qt_remote>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/mock>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/implementations/plain>
+    )
+    # Ship only the shared object (the C ABI header travels with the static
+    # package / include export). No EXPORT set — this is a runtime artifact.
+    install(TARGETS logos_protocol_shared
+        LIBRARY DESTINATION lib
+        RUNTIME DESTINATION bin
+    )
+endif()
+
 # Install headers. Moved headers keep the exact relative paths they had when
 # they shipped from logos-cpp-sdk, so downstream `#include "token_manager.h"`
 # (etc.) keep resolving unchanged through propagated include dirs.

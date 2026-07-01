@@ -18,6 +18,7 @@
           src = ./.;
 
           lib = import ./nix/lib.nix { inherit pkgs common src; };
+          shared = import ./nix/shared.nix { inherit pkgs common src; };
           include = import ./nix/include.nix { inherit pkgs common src; };
           tests = import ./nix/tests.nix { inherit pkgs common src; };
 
@@ -35,6 +36,7 @@
         in
         {
           logos-protocol-lib = lib;
+          logos-protocol-shared = shared;
           logos-protocol-include = include;
           inherit tests;
 
