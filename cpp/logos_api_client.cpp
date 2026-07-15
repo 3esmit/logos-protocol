@@ -150,6 +150,19 @@ void LogosAPIClient::invokeRemoteMethodAsync(const QString& objectName, const QS
                                               const QVariantList& args, AsyncResultCallback callback,
                                               Timeout timeout)
 {
+    // Delegate to the CallError-aware overload; legacy callers just drop the
+    // error field. Keeps the handshake-coalescing logic single-sourced.
+    invokeRemoteMethodAsync(objectName, methodName, args,
+        [cb = std::move(callback)](QVariant r, const logos::CallError&) mutable {
+            if (cb) cb(std::move(r));
+        },
+        timeout);
+}
+
+void LogosAPIClient::invokeRemoteMethodAsync(const QString& objectName, const QString& methodName,
+                                              const QVariantList& args, AsyncResultErrorCallback callback,
+                                              Timeout timeout)
+{
     if (!callback) return;
 
     // The async path acquires a replica too, so it must also run on the owner

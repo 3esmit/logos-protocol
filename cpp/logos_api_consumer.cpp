@@ -138,6 +138,20 @@ void LogosAPIConsumer::invokeRemoteMethodAsync(const QString& authToken, const Q
                                                 AsyncResultCallback callback,
                                                 Timeout timeout)
 {
+    // Delegate to the CallError-aware overload so there is one acquire/dispatch
+    // path — the legacy callback simply drops the error field.
+    invokeRemoteMethodAsync(authToken, objectName, methodName, args,
+        [cb = std::move(callback)](QVariant r, const logos::CallError&) mutable {
+            if (cb) cb(std::move(r));
+        },
+        timeout);
+}
+
+void LogosAPIConsumer::invokeRemoteMethodAsync(const QString& authToken, const QString& objectName, const QString& methodName,
+                                                const QVariantList& args,
+                                                AsyncResultErrorCallback callback,
+                                                Timeout timeout)
+{
     if (!callback) {
         qWarning() << "LogosAPIConsumer: invokeRemoteMethodAsync called with null callback";
         return;
@@ -146,7 +160,13 @@ void LogosAPIConsumer::invokeRemoteMethodAsync(const QString& authToken, const Q
     LogosObject* plugin = m_transport->requestObject(objectName, timeout.ms);
     if (!plugin) {
         qWarning() << "LogosAPIConsumer: Failed to acquire plugin/replica for object:" << objectName;
-        QTimer::singleShot(0, this, [callback]() { callback(QVariant()); });
+        logos::CallError err;
+        err.code = "object_unavailable";
+        err.message = "failed to acquire remote object '"
+                      + objectName.toStdString()
+                      + "' (module not loaded, not published, or transport failure)";
+        err.origin = objectName.toStdString();
+        QTimer::singleShot(0, this, [callback, err]() { callback(QVariant(), err); });
         return;
     }
 
@@ -165,7 +185,7 @@ void LogosAPIConsumer::invokeRemoteMethodAsync(const QString& authToken, const Q
                 plugin->release();
                 return;
             }
-            callback(result);
+            callback(result, logos::CallError{});
             plugin->release();
         });
 }
