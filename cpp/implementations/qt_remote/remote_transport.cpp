@@ -1,5 +1,6 @@
 #include "remote_transport.h"
 #include "../../logos_async_dispatch.h"
+#include "../../logos_socket_paths.h"
 #include <QRemoteObjectRegistryHost>
 #include <QRemoteObjectNode>
 #include <QRemoteObjectReplica>
@@ -8,6 +9,7 @@
 #include <QTimer>
 #include <QEventLoop>
 #include <QDebug>
+#include <QDir>
 #include <QUrl>
 #include <QMetaObject>
 #include <QTime>
@@ -18,6 +20,23 @@
 // Process-wide count of replicas acquired by requestObject() — a test hook to
 // prove the consumer reuses one cached handle instead of re-acquiring per call.
 static std::atomic<long> g_acquireCount{0};
+
+namespace {
+
+// Reproduce Qt's QLocalServer name->path rule so we can post-process the socket
+// file QtRO created — QtRO never exposes its underlying QLocalServer, so we
+// cannot ask it for the path or set its options. A relative name lands under
+// QDir::tempPath(); an absolute path (e.g. from a relocated socket dir) is used
+// verbatim. Only meaningful for `local:` URLs.
+QString localSocketFilePath(const QString& registryUrl)
+{
+    const QString path = QUrl(registryUrl).path();
+    if (path.startsWith(QLatin1Char('/')))
+        return path;
+    return QDir::cleanPath(QDir::tempPath()) + QLatin1Char('/') + path;
+}
+
+}  // namespace
 
 // ── RemoteLogosObject ────────────────────────────────────────────────────────
 
@@ -401,10 +420,33 @@ RemoteTransportHost::~RemoteTransportHost()
 bool RemoteTransportHost::publishObject(const QString& name, QObject* object)
 {
     if (!m_registryHost) {
-        m_registryHost = new QRemoteObjectRegistryHost(QUrl(m_registryUrl));
-        if (!m_registryHost) {
-            qCritical() << "RemoteTransportHost: Failed to create registry host";
+        // Construct WITHOUT a URL and listen via setRegistryUrl() so we can
+        // observe the result. The QUrl-taking ctor swallows the listen bool: on
+        // a failed bind (stale socket, permission denied, sun_path overflow) it
+        // leaves a half-built host that silently rejects every enableRemoting()
+        // with OperationNotValidOnClientNode — the failure only surfaced as
+        // clients hanging on a dead endpoint.
+        auto* host = new QRemoteObjectRegistryHost();
+        if (!host->setRegistryUrl(QUrl(m_registryUrl))) {
+            qCritical() << "RemoteTransportHost: failed to listen on" << m_registryUrl
+                        << "- error" << host->lastError()
+                        << "- socket path" << localSocketFilePath(m_registryUrl);
+            delete host;
             return false;
+        }
+        m_registryHost = host;
+
+        // Make the freshly-bound socket reachable by a co-resident client per
+        // the LOGOS_SOCKET_GROUP / LOGOS_SOCKET_MODE policy. No-op when those
+        // env vars are unset (socket keeps its owner-only default). Only `local:`
+        // registries have a socket file — a tcp:// one does not.
+        if (QUrl(m_registryUrl).scheme() == QLatin1String("local")) {
+            std::string permErr;
+            if (!logos::applySocketPerms(
+                    localSocketFilePath(m_registryUrl).toStdString(), &permErr)) {
+                qWarning() << "RemoteTransportHost: could not apply socket perms:"
+                           << QString::fromStdString(permErr);
+            }
         }
         qDebug() << "RemoteTransportHost: Created registry host with URL:" << m_registryUrl;
     }
