@@ -209,3 +209,60 @@ TEST(JsonConvertArgs, NestedObjectArgRoundTripsToQVariantMap)
     EXPECT_EQ(inner.value("port").toLongLong(), 30303);
     EXPECT_EQ(inner.value("name").toString(), "node-a");
 }
+
+// Integers inside a container must NOT be degraded to doubles. The historical
+// bug: QJsonValue::fromVariant turned a QVariantList of ints into a float array,
+// so a strict `.get<std::vector<int64_t>>()` on the C-ABI side threw and the
+// generated dispatch decoded an EMPTY vector (a `[int]` param arrived empty).
+TEST(JsonConvertInts, IntListElementsStayIntegers)
+{
+    const QVariantList list{1, 2, 3};
+    nlohmann::json j = qvariantToNlohmann(QVariant(list));
+
+    ASSERT_TRUE(j.is_array());
+    ASSERT_EQ(j.size(), 3u);
+    for (const auto& e : j)
+        EXPECT_TRUE(e.is_number_integer()) << "degraded element: " << e.dump();
+    EXPECT_EQ(j.get<std::vector<int64_t>>(), (std::vector<int64_t>{1, 2, 3}));
+}
+
+TEST(JsonConvertInts, LongLongListElementsStayIntegers)
+{
+    // Over QtRO ints commonly arrive as qlonglong; same requirement. Use values
+    // ABOVE 2^53 so an accidental round-trip through IEEE-754 double would lose
+    // precision (or serialize in scientific notation) and fail the assertion —
+    // small values <= 2^53 survive a double detour and wouldn't pin the bug.
+    const qlonglong big  = Q_INT64_C(9007199254740993);   // 2^53 + 1
+    const qlonglong huge = Q_INT64_C(9223372036854775807); // INT64_MAX
+    QVariantList list;
+    list << big << huge;
+    nlohmann::json j = qvariantToNlohmann(QVariant(list));
+
+    ASSERT_TRUE(j.is_array());
+    for (const auto& e : j)
+        EXPECT_TRUE(e.is_number_integer()) << "degraded element: " << e.dump();
+    EXPECT_EQ(j.get<std::vector<int64_t>>(), (std::vector<int64_t>{big, huge}));
+}
+
+TEST(JsonConvertInts, NestedMapIntValueStaysInteger)
+{
+    QVariantMap m;
+    m.insert("n", 42);
+    m.insert("s", QStringLiteral("x"));
+    nlohmann::json j = qvariantToNlohmann(QVariant(m));
+
+    ASSERT_TRUE(j.is_object());
+    EXPECT_TRUE(j["n"].is_number_integer());
+    EXPECT_EQ(j["n"].get<int64_t>(), 42);
+    EXPECT_EQ(j["s"].get<std::string>(), "x");
+}
+
+TEST(JsonConvertInts, StringListStillDecodesAsStrings)
+{
+    // Regression guard: the fix must not disturb the [tstr] path.
+    const QStringList sl{"a", "b"};
+    nlohmann::json j = qvariantToNlohmann(QVariant(sl));
+
+    ASSERT_TRUE(j.is_array());
+    EXPECT_EQ(j.get<std::vector<std::string>>(), (std::vector<std::string>{"a", "b"}));
+}
