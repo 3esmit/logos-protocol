@@ -69,6 +69,13 @@ void ModuleProxy::setTokenValidator(TokenValidator validator)
     m_validator = std::move(validator);
 }
 
+// QtRO / local path: RemoteTransportHost only ever serves a local socket, so
+// the wire is "local". Forwards to the transport-aware overload.
+QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args)
+{
+    return callRemoteMethod(authToken, methodName, args, QStringLiteral("local"));
+}
+
 QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args, const QString& transportProtocol)
 {
     if (!m_provider) {

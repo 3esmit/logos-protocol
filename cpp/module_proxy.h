@@ -9,6 +9,7 @@
 #include <QJsonArray>
 
 #include <functional>
+#include <utility>
 
 class LogosProviderObject;
 
@@ -41,11 +42,16 @@ public:
 
     void setTokenValidator(TokenValidator validator);
 
-    // `transportProtocol` identifies the wire the call arrived on so a
-    // transport-sensitive validator (local_only tokens) can enforce it. The
-    // 3-arg form is the local path and defaults it to "local"; remote hosts
-    // that know their protocol pass it explicitly.
-    Q_INVOKABLE QVariant callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args = QVariantList(), const QString& transportProtocol = QStringLiteral("local"));
+    // Two explicit Q_INVOKABLE overloads rather than one with a defaulted
+    // transport arg: the Qt meta-object system matches by full parameter list
+    // and does not apply C++ default arguments, so the existing QtRO/local
+    // 3-arg call must remain a real 3-arg method. It forwards to the
+    // transport-aware 4-arg form with "local" (RemoteTransportHost is always
+    // local); remote hosts that know their wire (PlainTransportHost) call the
+    // 4-arg form so a transport-sensitive validator (local_only tokens) can
+    // enforce it.
+    Q_INVOKABLE QVariant callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args = QVariantList());
+    Q_INVOKABLE QVariant callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args, const QString& transportProtocol);
     Q_INVOKABLE bool informModuleToken(const QString& authToken, const QString& moduleName, const QString& token);
     bool saveToken(const QString& from_module_name, const QString& token);
     // getPluginInterface() returns the module's whole interface (methods AND
