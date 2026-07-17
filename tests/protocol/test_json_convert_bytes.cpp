@@ -228,15 +228,20 @@ TEST(JsonConvertInts, IntListElementsStayIntegers)
 
 TEST(JsonConvertInts, LongLongListElementsStayIntegers)
 {
-    // Over QtRO ints commonly arrive as qlonglong; same requirement.
+    // Over QtRO ints commonly arrive as qlonglong; same requirement. Use values
+    // ABOVE 2^53 so an accidental round-trip through IEEE-754 double would lose
+    // precision (or serialize in scientific notation) and fail the assertion —
+    // small values <= 2^53 survive a double detour and wouldn't pin the bug.
+    const qlonglong big  = Q_INT64_C(9007199254740993);   // 2^53 + 1
+    const qlonglong huge = Q_INT64_C(9223372036854775807); // INT64_MAX
     QVariantList list;
-    list << static_cast<qlonglong>(10) << static_cast<qlonglong>(20);
+    list << big << huge;
     nlohmann::json j = qvariantToNlohmann(QVariant(list));
 
     ASSERT_TRUE(j.is_array());
     for (const auto& e : j)
-        EXPECT_TRUE(e.is_number_integer());
-    EXPECT_EQ(j.get<std::vector<int64_t>>(), (std::vector<int64_t>{10, 20}));
+        EXPECT_TRUE(e.is_number_integer()) << "degraded element: " << e.dump();
+    EXPECT_EQ(j.get<std::vector<int64_t>>(), (std::vector<int64_t>{big, huge}));
 }
 
 TEST(JsonConvertInts, NestedMapIntValueStaysInteger)
