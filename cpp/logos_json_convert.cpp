@@ -49,22 +49,11 @@ nlohmann::json qvariantToNlohmann(const QVariant& v)
         const LogosResult lr = v.value<LogosResult>();
         nlohmann::json obj;
         obj["success"] = lr.success;
-        if (lr.value.userType() == QMetaType::QByteArray) {
-            // Bytes inside a LogosResult take the same tagged form — the
-            // QJsonValue::fromVariant fallback below would mangle them.
-            obj["value"] = byteArrayToTaggedJson(lr.value.toByteArray());
-        } else {
-        QJsonValue valJson = QJsonValue::fromVariant(lr.value);
-        if (valJson.isObject() || valJson.isArray()) {
-            QJsonDocument d = valJson.isObject() ? QJsonDocument(valJson.toObject())
-                                                 : QJsonDocument(valJson.toArray());
-            try { obj["value"] = nlohmann::json::parse(d.toJson(QJsonDocument::Compact).toStdString()); }
-            catch (...) { obj["value"] = nullptr; }
-        } else if (valJson.isString()) obj["value"] = valJson.toString().toStdString();
-        else if (valJson.isBool())     obj["value"] = valJson.toBool();
-        else if (valJson.isDouble())   obj["value"] = valJson.toDouble();
-        else                           obj["value"] = nullptr;
-        }
+        // Recurse so the result value keeps its exact shape: bytes -> tagged
+        // form, nested integers stay integers, maps/lists preserved (the old
+        // QJsonValue::fromVariant path degraded numerics to double and mangled
+        // bytes).
+        obj["value"] = qvariantToNlohmann(lr.value);
         QJsonValue errJson = QJsonValue::fromVariant(lr.error);
         obj["error"] = errJson.isString() ? nlohmann::json(errJson.toString().toStdString())
                                            : nullptr;
@@ -91,6 +80,33 @@ nlohmann::json qvariantToNlohmann(const QVariant& v)
     case QMetaType::LongLong:  return static_cast<int64_t>(v.toLongLong());
     case QMetaType::ULongLong: return static_cast<uint64_t>(v.toULongLong());
     default: break;
+    }
+
+    // Containers: recurse element-by-element so NESTED integers keep their type
+    // too. The QJsonValue::fromVariant fallback below degrades every numeric to
+    // double at every depth, so a `[int]` param (a QVariantList of ints) would
+    // arrive as [1.0, 2.0, ...] and a strict `.get<std::vector<int64_t>>()` on
+    // the C-ABI side throws -> the dispatch decodes an empty vector. The scalar
+    // switch above only covers a top-level number; these cover the list/map/
+    // string-list wrappers that carry them.
+    if (v.userType() == QMetaType::QStringList) {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const QString& s : v.toStringList())
+            arr.push_back(s.toStdString());
+        return arr;
+    }
+    if (v.userType() == QMetaType::QVariantList) {
+        nlohmann::json arr = nlohmann::json::array();
+        for (const QVariant& e : v.toList())
+            arr.push_back(qvariantToNlohmann(e));
+        return arr;
+    }
+    if (v.userType() == QMetaType::QVariantMap) {
+        nlohmann::json obj = nlohmann::json::object();
+        const QVariantMap m = v.toMap();
+        for (auto it = m.constBegin(); it != m.constEnd(); ++it)
+            obj[it.key().toStdString()] = qvariantToNlohmann(it.value());
+        return obj;
     }
 
     QJsonValue jv = QJsonValue::fromVariant(v);
