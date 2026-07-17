@@ -1,6 +1,7 @@
 #include "remote_transport.h"
 #include "../../logos_async_dispatch.h"
 #include "../../logos_socket_paths.h"
+#include "qt_socket_path.h"
 #include <QRemoteObjectRegistryHost>
 #include <QRemoteObjectNode>
 #include <QRemoteObjectReplica>
@@ -9,7 +10,6 @@
 #include <QTimer>
 #include <QEventLoop>
 #include <QDebug>
-#include <QDir>
 #include <QUrl>
 #include <QMetaObject>
 #include <QTime>
@@ -21,22 +21,7 @@
 // prove the consumer reuses one cached handle instead of re-acquiring per call.
 static std::atomic<long> g_acquireCount{0};
 
-namespace {
-
-// Reproduce Qt's QLocalServer name->path rule so we can post-process the socket
-// file QtRO created — QtRO never exposes its underlying QLocalServer, so we
-// cannot ask it for the path or set its options. A relative name lands under
-// QDir::tempPath(); an absolute path (e.g. from a relocated socket dir) is used
-// verbatim. Only meaningful for `local:` URLs.
-QString localSocketFilePath(const QString& registryUrl)
-{
-    const QString path = QUrl(registryUrl).path();
-    if (path.startsWith(QLatin1Char('/')))
-        return path;
-    return QDir::cleanPath(QDir::tempPath()) + QLatin1Char('/') + path;
-}
-
-}  // namespace
+using logos::qtremote::localSocketFilePath;
 
 // ── RemoteLogosObject ────────────────────────────────────────────────────────
 

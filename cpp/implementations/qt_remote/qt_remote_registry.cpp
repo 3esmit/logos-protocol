@@ -1,23 +1,11 @@
 #include "qt_remote_registry.h"
 #include "../../logos_socket_paths.h"
+#include "qt_socket_path.h"
 #include <QRemoteObjectRegistryHost>
-#include <QDir>
 #include <QUrl>
 #include <QDebug>
 
-namespace {
-
-// See remote_transport.cpp — reproduce Qt's QLocalServer name->path rule so we
-// can apply the socket-access policy to the file QtRO created.
-QString localSocketFilePath(const QString& url)
-{
-    const QString path = QUrl(url).path();
-    if (path.startsWith(QLatin1Char('/')))
-        return path;
-    return QDir::cleanPath(QDir::tempPath()) + QLatin1Char('/') + path;
-}
-
-}  // namespace
+using logos::qtremote::localSocketFilePath;
 
 QtRemoteRegistry::QtRemoteRegistry(const QString& url)
     : m_registryHost(nullptr)

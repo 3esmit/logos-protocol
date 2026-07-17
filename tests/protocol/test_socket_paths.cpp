@@ -129,6 +129,29 @@ TEST(SocketPaths, NoEnvIsNoOp)
     ::unlink(path.c_str());
 }
 
+// With the policy set, a path that isn't a socket we own is refused rather than
+// chmod'd — guards against a malformed URL producing a stray path.
+TEST(SocketPaths, RefusesNonSocketPath)
+{
+    const std::string path = sockPath("notsock");
+    ::unlink(path.c_str());
+    int fd = ::open(path.c_str(), O_CREAT | O_WRONLY, 0644);
+    ASSERT_GE(fd, 0);
+    ::close(fd);
+
+    EnvGuard grp("LOGOS_SOCKET_GROUP", nullptr);
+    EnvGuard mode("LOGOS_SOCKET_MODE", "0660");
+    std::string err;
+    EXPECT_FALSE(logos::applySocketPerms(path, &err));
+    EXPECT_FALSE(err.empty());
+
+    // The file's mode is unchanged (still 0644, not 0660).
+    struct stat st;
+    ASSERT_EQ(::lstat(path.c_str(), &st), 0);
+    EXPECT_EQ(st.st_mode & 07777, 0644u);
+    ::unlink(path.c_str());
+}
+
 // A malformed mode is rejected (returns false) and changes nothing.
 TEST(SocketPaths, RejectsBadMode)
 {
@@ -211,6 +234,10 @@ TEST(SocketPaths, ReaperRemovesOnlyDeadSockets)
     int rf = ::open(filePath.c_str(), O_CREAT | O_WRONLY, 0644);
     ASSERT_GE(rf, 0);
     ::close(rf);
+
+    // An empty prefix is refused outright (would sweep every dead socket we
+    // own in dir) — nothing removed.
+    EXPECT_EQ(logos::reapStaleSockets(dir, ""), 0u);
 
     const std::size_t removed = logos::reapStaleSockets(dir, prefix);
     EXPECT_EQ(removed, 1u);

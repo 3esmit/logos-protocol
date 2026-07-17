@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include <dirent.h>
@@ -25,7 +26,15 @@ bool resolveGid(const std::string& spec, gid_t& out)
 {
     if (!spec.empty() &&
         spec.find_first_not_of("0123456789") == std::string::npos) {
-        out = static_cast<gid_t>(std::strtoul(spec.c_str(), nullptr, 10));
+        errno = 0;
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(spec.c_str(), &end, 10);
+        // Reject overflow and any value that doesn't fit gid_t — a truncated
+        // gid would silently chgrp to the wrong group.
+        if (errno != 0 || end == spec.c_str() || *end != '\0' ||
+            v > static_cast<unsigned long>(std::numeric_limits<gid_t>::max()))
+            return false;
+        out = static_cast<gid_t>(v);
         return true;
     }
 
@@ -70,8 +79,24 @@ bool applySocketPerms(const std::string& absPath, std::string* errOut)
         return false;
     };
 
-    if (const char* grpEnv = std::getenv("LOGOS_SOCKET_GROUP");
-        grpEnv && *grpEnv) {
+    const char* grpEnv  = std::getenv("LOGOS_SOCKET_GROUP");
+    const char* modeEnv = std::getenv("LOGOS_SOCKET_MODE");
+    const bool wantGroup = grpEnv && *grpEnv;
+    const bool wantMode  = modeEnv && *modeEnv;
+    if (!wantGroup && !wantMode) return true;  // policy unset: no-op, touch nothing
+
+    // Only ever change a socket we own. If a malformed URL produced a path that
+    // isn't the socket we just bound, refuse rather than chmod/chown a stray
+    // file. (Mirrors isSocketDead's owner check.)
+    struct stat st;
+    if (::lstat(absPath.c_str(), &st) != 0)
+        return fail("stat(" + absPath + ") failed: " + std::strerror(errno));
+    if (!S_ISSOCK(st.st_mode))
+        return fail(absPath + " is not a socket — refusing to change perms");
+    if (st.st_uid != ::geteuid())
+        return fail(absPath + " is not owned by us — refusing to change perms");
+
+    if (wantGroup) {
         gid_t gid = 0;
         if (!resolveGid(grpEnv, gid))
             return fail(std::string("unknown group '") + grpEnv + "'");
@@ -80,8 +105,7 @@ bool applySocketPerms(const std::string& absPath, std::string* errOut)
             return fail("chown(" + absPath + ") failed: " + std::strerror(errno));
     }
 
-    if (const char* modeEnv = std::getenv("LOGOS_SOCKET_MODE");
-        modeEnv && *modeEnv) {
+    if (wantMode) {
         mode_t mode = 0;
         if (!parseOctalMode(modeEnv, mode))
             return fail(std::string("invalid LOGOS_SOCKET_MODE '") + modeEnv + "'");
@@ -123,6 +147,11 @@ bool isSocketDead(const std::string& absPath)
 
 std::size_t reapStaleSockets(const std::string& dir, const std::string& prefix)
 {
+    // Refuse an empty prefix: it would make every dead socket the process owns
+    // (anywhere in `dir`) a deletion candidate. Callers always know the family
+    // of sockets they created ("logos_"), so this is misuse, not a valid sweep.
+    if (prefix.empty()) return 0;
+
     DIR* d = ::opendir(dir.c_str());
     if (!d) return 0;
 
