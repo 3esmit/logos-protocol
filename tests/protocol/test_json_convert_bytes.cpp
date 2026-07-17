@@ -97,6 +97,71 @@ TEST(JsonConvertBytes, LogosResultValueBytesAreTagged)
     EXPECT_EQ(back.toByteArray(), QByteArray("p\0q", 3));
 }
 
+// Bytes NESTED inside a container argument must keep the tagged form.
+// LogosProviderObject::callMethodStdBridge converts each call argument
+// individually via qvariantToNlohmann, so a top-level QByteArray argument
+// already hits the tagged case above — the break was specifically an argument
+// that is itself a QVariantList/QVariantMap CONTAINING a QByteArray. In the
+// cdylib path this is exactly callModuleMethod's 3rd argument (the nested
+// call-args list), which over QtRO arrives as a QVariantList holding the bstr
+// param as a QByteArray. Before the fix, the canConvert<QJsonArray>/<QJsonObject>
+// fallbacks caught that container FIRST and routed it through QJson, which has no
+// byte type — the nested QByteArray was flattened to a plain string, so a Rust
+// cdylib's {"_bytes":...} decoder saw "hello" and produced an empty Vec
+// (echoBytes → null).
+TEST(JsonConvertBytes, NestedByteArrayInListStaysTagged)
+{
+    const QVariantList list{QVariant(QByteArray("hi\0!", 4))};
+    nlohmann::json j = qvariantToNlohmann(QVariant(list));
+
+    ASSERT_TRUE(j.is_array()) << j.dump();
+    ASSERT_EQ(j.size(), 1u);
+    ASSERT_TRUE(j[0].is_object()) << j.dump();
+    ASSERT_TRUE(j[0].contains("_bytes")) << j.dump();
+
+    QVariant back = nlohmannToQVariant(j[0]);
+    ASSERT_EQ(back.userType(), QMetaType::QByteArray);
+    EXPECT_EQ(back.toByteArray(), QByteArray("hi\0!", 4));
+}
+
+TEST(JsonConvertBytes, NestedByteArrayInMapStaysTagged)
+{
+    QVariantMap m;
+    m.insert("blob", QVariant(QByteArray("p\0q", 3)));
+    m.insert("name", QStringLiteral("n"));
+    nlohmann::json j = qvariantToNlohmann(QVariant(m));
+
+    ASSERT_TRUE(j.is_object()) << j.dump();
+    ASSERT_TRUE(j["blob"].is_object()) << j.dump();
+    ASSERT_TRUE(j["blob"].contains("_bytes")) << j.dump();
+    EXPECT_EQ(j["name"].get<std::string>(), "n");
+
+    QVariant back = nlohmannToQVariant(j["blob"]);
+    ASSERT_EQ(back.userType(), QMetaType::QByteArray);
+    EXPECT_EQ(back.toByteArray(), QByteArray("p\0q", 3));
+}
+
+TEST(JsonConvertBytes, ByteArrayArgInListSurvivesBridgeConversion)
+{
+    // A list-valued argument that contains a bstr — the shape of
+    // callModuleMethod's nested call-args argument, which callMethodStdBridge
+    // hands to qvariantToNlohmann as a single QVariantList. It must yield
+    // [{"_bytes":...}] so the next hop's nlohmannArgsToQVariantList recovers a
+    // QByteArray, not the string "hello".
+    const QVariantList callArgs{QVariant(QByteArray("hello"))};
+    nlohmann::json jArgs = qvariantToNlohmann(QVariant(callArgs));
+
+    ASSERT_TRUE(jArgs.is_array()) << jArgs.dump();
+    ASSERT_EQ(jArgs.size(), 1u);
+    ASSERT_TRUE(jArgs[0].is_object()) << jArgs.dump();
+    ASSERT_TRUE(jArgs[0].contains("_bytes")) << jArgs.dump();
+
+    const QVariantList redecoded = nlohmannArgsToQVariantList(jArgs);
+    ASSERT_EQ(redecoded.size(), 1);
+    ASSERT_EQ(redecoded[0].userType(), QMetaType::QByteArray);
+    EXPECT_EQ(redecoded[0].toByteArray(), QByteArray("hello"));
+}
+
 TEST(JsonConvertBytes, OrdinaryObjectsAreNotMistakenForBytes)
 {
     // Two keys → a real map, even though one key is "_bytes".

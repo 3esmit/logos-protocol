@@ -60,17 +60,6 @@ nlohmann::json qvariantToNlohmann(const QVariant& v)
         return obj;
     }
 
-    if (v.canConvert<QJsonObject>()) {
-        QJsonDocument doc(v.toJsonObject());
-        try { return nlohmann::json::parse(doc.toJson(QJsonDocument::Compact).toStdString()); }
-        catch (...) {}
-    }
-    if (v.canConvert<QJsonArray>()) {
-        QJsonDocument doc(qvariant_cast<QJsonArray>(v));
-        try { return nlohmann::json::parse(doc.toJson(QJsonDocument::Compact).toStdString()); }
-        catch (...) {}
-    }
-
     // Integers stay integers: QJsonValue::fromVariant degrades every numeric
     // to double, which a strict consumer on the other side of the C ABI
     // (e.g. a generated dispatch reading an int param) must not see as 5.0.
@@ -107,6 +96,25 @@ nlohmann::json qvariantToNlohmann(const QVariant& v)
         for (auto it = m.constBegin(); it != m.constEnd(); ++it)
             obj[it.key().toStdString()] = qvariantToNlohmann(it.value());
         return obj;
+    }
+
+    // Fallbacks for QVariants that are natively Qt JSON types (e.g. a module
+    // handed back a QJsonObject/QJsonArray directly). These run AFTER the
+    // container recursion above ON PURPOSE: a QVariantList/QVariantMap also
+    // reports canConvert<QJsonArray/Object>(), and routing it through QJson here
+    // would flatten a nested QByteArray to a plain string (QJson has no byte
+    // type) and degrade nested numerics to double — the exact losses the
+    // recursion prevents. So containers must be handled first; only genuine
+    // QJson-typed variants reach this point.
+    if (v.canConvert<QJsonObject>()) {
+        QJsonDocument doc(v.toJsonObject());
+        try { return nlohmann::json::parse(doc.toJson(QJsonDocument::Compact).toStdString()); }
+        catch (...) {}
+    }
+    if (v.canConvert<QJsonArray>()) {
+        QJsonDocument doc(qvariant_cast<QJsonArray>(v));
+        try { return nlohmann::json::parse(doc.toJson(QJsonDocument::Compact).toStdString()); }
+        catch (...) {}
     }
 
     QJsonValue jv = QJsonValue::fromVariant(v);
