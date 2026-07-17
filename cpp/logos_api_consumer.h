@@ -96,6 +96,17 @@ public:
     using AsyncResultCallback = std::function<void(QVariant)>;
 
     /**
+     * @brief Async result callback with an explicit error channel.
+     *
+     * Mirrors the sync `invokeRemoteMethod(..., CallError*)` overload:
+     * the callback receives the same {code, message, origin} error struct,
+     * so callers can distinguish "the module's source could not be acquired"
+     * from "the call ran but returned an invalid QVariant". On success the
+     * error is cleared (ok() == true).
+     */
+    using AsyncResultErrorCallback = std::function<void(QVariant, const logos::CallError&)>;
+
+    /**
      * @brief Invoke a remote method asynchronously; result is delivered via callback
      * @param authToken Authentication token for the operation
      * @param objectName The name of the remote object
@@ -107,6 +118,19 @@ public:
     void invokeRemoteMethodAsync(const QString& authToken, const QString& objectName, const QString& methodName,
                                  const QVariantList& args,
                                  AsyncResultCallback callback,
+                                 Timeout timeout = Timeout());
+
+    /**
+     * @brief invokeRemoteMethodAsync with an explicit error out-channel.
+     *
+     * Sets the CallError to code="object_unavailable" when acquire fails
+     * (matching the sync overload's semantics — see logos_call_error.h),
+     * cleared on success. Callers that need to react to acquire failure
+     * differently from "call returned no value" should use this overload.
+     */
+    void invokeRemoteMethodAsync(const QString& authToken, const QString& objectName, const QString& methodName,
+                                 const QVariantList& args,
+                                 AsyncResultErrorCallback callback,
                                  Timeout timeout = Timeout());
 
     /**
