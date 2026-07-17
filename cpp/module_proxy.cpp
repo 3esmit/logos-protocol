@@ -64,7 +64,12 @@ bool ModuleProxy::saveToken(const QString& from_module_name, const QString& toke
     return true;
 }
 
-QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args)
+void ModuleProxy::setTokenValidator(TokenValidator validator)
+{
+    m_validator = std::move(validator);
+}
+
+QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args, const QString& transportProtocol)
 {
     if (!m_provider) {
         qWarning() << "ModuleProxy: Cannot call method on null provider:" << methodName;
@@ -94,7 +99,7 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
     // capability_module token exchange. Everything past this point is a real
     // business-method dispatch and MUST be authorized.
 
-    if (!isAuthorized(authToken)) {
+    if (!isAuthorized(authToken, transportProtocol)) {
         qWarning() << "ModuleProxy: rejecting unauthorized call to" << methodName
                    << "- auth token not recognized";
         // Structured rejection instead of a bare QVariant() so a NEW consumer can
@@ -164,7 +169,7 @@ bool ModuleProxy::informModuleToken(const QString& authToken, const QString& mod
     return m_provider->informModuleToken(moduleName, token);
 }
 
-bool ModuleProxy::isAuthorized(const QString& authToken) const
+bool ModuleProxy::isAuthorized(const QString& authToken, const QString& transportProtocol) const
 {
     // Fail closed: an empty token is never valid, even if some empty value
     // somehow ended up in a token store.
@@ -188,7 +193,19 @@ bool ModuleProxy::isAuthorized(const QString& authToken) const
     for (const QString& key : TokenManager::instance().getTokenKeys()) {
         authorized |= constantTimeEquals(authToken, TokenManager::instance().getToken(key));
     }
-    return authorized;
+    if (authorized) {
+        return true;
+    }
+
+    // Not one of our own issued tokens — give a host-installed validator the
+    // chance to accept it for this transport. This is how operator-issued named
+    // tokens (validated against the daemon's TokenStore, with expiry and
+    // local_only enforced by `transportProtocol`) authorize a call without
+    // being pre-registered in the in-process stores above.
+    if (m_validator) {
+        return m_validator(authToken, transportProtocol);
+    }
+    return false;
 }
 
 namespace {

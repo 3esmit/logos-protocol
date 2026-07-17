@@ -347,14 +347,23 @@ void PlainTransportHost::onCall(const CallMessage& req, CallReply reply)
     QVariantList args    = rpcListToQVariantList(req.args);
     uint64_t id = req.id;
 
-    QMetaObject::invokeMethod(obj, [obj, authToken, methodName, args, id, reply]() {
+    // The wire this call arrived on, so the provider can enforce local_only
+    // tokens. This host only ever serves the remote plain protocols (LocalSocket
+    // is handled by RemoteTransportHost). Default to the non-local label so an
+    // unexpected protocol fails closed for a local_only token.
+    QString transportProtocol = QStringLiteral("tcp");
+    if (m_cfg.protocol == LogosProtocol::TcpSsl)
+        transportProtocol = QStringLiteral("tcp_ssl");
+
+    QMetaObject::invokeMethod(obj, [obj, authToken, methodName, args, transportProtocol, id, reply]() {
         QVariant ret;
         bool ok = QMetaObject::invokeMethod(obj, "callRemoteMethod",
                                             Qt::DirectConnection,
                                             Q_RETURN_ARG(QVariant, ret),
                                             Q_ARG(QString, authToken),
                                             Q_ARG(QString, methodName),
-                                            Q_ARG(QVariantList, args));
+                                            Q_ARG(QVariantList, args),
+                                            Q_ARG(QString, transportProtocol));
         ResultMessage res;
         res.id = id;
         if (ok) {

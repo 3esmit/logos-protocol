@@ -8,6 +8,8 @@
 #include <QString>
 #include <QJsonArray>
 
+#include <functional>
+
 class LogosProviderObject;
 
 /**
@@ -24,10 +26,26 @@ class ModuleProxy : public QObject
     Q_OBJECT
 
 public:
+    // A host-installed extra authorizer. Returns true if `token` is valid for a
+    // call arriving over `transportProtocol` ("local" | "tcp" | "tcp_ssl").
+    // Consulted IN ADDITION to the built-in issued-token scan, so installing one
+    // only ever grants access to tokens the built-in scan wouldn't (e.g. the
+    // daemon backs it with TokenStore::lookupByToken to make operator-issued
+    // named tokens work, with per-token expiry and local_only enforced by the
+    // transport it's handed).
+    using TokenValidator = std::function<bool(const QString& token,
+                                              const QString& transportProtocol)>;
+
     explicit ModuleProxy(LogosProviderObject* provider, QObject* parent = nullptr);
     ~ModuleProxy();
 
-    Q_INVOKABLE QVariant callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args = QVariantList());
+    void setTokenValidator(TokenValidator validator);
+
+    // `transportProtocol` identifies the wire the call arrived on so a
+    // transport-sensitive validator (local_only tokens) can enforce it. The
+    // 3-arg form is the local path and defaults it to "local"; remote hosts
+    // that know their protocol pass it explicitly.
+    Q_INVOKABLE QVariant callRemoteMethod(const QString& authToken, const QString& methodName, const QVariantList& args = QVariantList(), const QString& transportProtocol = QStringLiteral("local"));
     Q_INVOKABLE bool informModuleToken(const QString& authToken, const QString& moduleName, const QString& token);
     bool saveToken(const QString& from_module_name, const QString& token);
     // getPluginInterface() returns the module's whole interface (methods AND
@@ -43,14 +61,16 @@ signals:
     void eventResponse(const QString& eventName, const QVariantList& data);
 
 private:
-    // Returns true only when authToken matches a token THIS module has issued
-    // (via saveToken / informModuleToken). Empty/unknown tokens are rejected.
-    // Comparison is constant-time and never early-outs, so neither a correct
+    // Returns true when authToken matches a token THIS module has issued (via
+    // saveToken / informModuleToken) OR the host-installed validator accepts it
+    // for `transportProtocol`. Empty/unknown tokens are rejected. The built-in
+    // comparison is constant-time and never early-outs, so neither a correct
     // prefix nor the number of issued tokens leaks through timing.
-    bool isAuthorized(const QString& authToken) const;
+    bool isAuthorized(const QString& authToken, const QString& transportProtocol) const;
 
     LogosProviderObject* m_provider;
     QHash<QString, QString> m_tokens;
+    TokenValidator m_validator;
 };
 
 #endif // MODULE_PROXY_H
