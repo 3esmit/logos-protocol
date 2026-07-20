@@ -148,10 +148,21 @@ public slots:
     std::string requestModule(const std::string& authToken, const std::string& originModule, const std::string& targetModule);
 
 private:
+    // Get a cached remote-object handle for objectName, (re)acquiring via the
+    // transport if absent or stale. Acquiring a QtRO replica (acquireDynamic +
+    // waitForSource) is expensive, so invokeRemoteMethod reuses one handle per
+    // object instead of acquiring + release()ing on every call.
+    LogosObject* acquireCachedObject(const QString& objectName, int timeoutMs);
+    // Release and drop every cached handle (destructor / reconnect).
+    void clearObjectCache();
+
     std::unique_ptr<LogosTransportConnection> m_transport;
     QString m_registryUrl;
     QMap<QString, QString> m_tokens;
     TokenManager* m_token_manager;
+    // Object-handle cache keyed by object name. Single-threaded: touched only on
+    // the consumer's event-loop thread.
+    QHash<QString, LogosObject*> m_objectCache;
 };
 
 #endif // LOGOS_API_CONSUMER_H

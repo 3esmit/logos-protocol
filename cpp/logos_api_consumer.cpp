@@ -63,6 +63,9 @@ LogosAPIConsumer::LogosAPIConsumer(const QString& module_to_talk_to,
 
 LogosAPIConsumer::~LogosAPIConsumer()
 {
+    // Release cached handles while m_transport is still alive (the destructor
+    // body runs before member destruction).
+    clearObjectCache();
 }
 
 LogosObject* LogosAPIConsumer::requestObject(const QString& objectName, Timeout timeout)
@@ -99,6 +102,9 @@ QString LogosAPIConsumer::registryUrl() const
 bool LogosAPIConsumer::reconnect()
 {
     qDebug() << "LogosAPIConsumer: Attempting to reconnect to registry:" << m_registryUrl;
+    // Handles from the old connection point at replicas that are now dead; drop
+    // them so the next call re-acquires against the fresh connection.
+    clearObjectCache();
     return m_transport->reconnect();
 }
 
@@ -114,7 +120,12 @@ QVariant LogosAPIConsumer::invokeRemoteMethod(const QString& authToken, const QS
     if (err) err->clear();
     qDebug() << "LogosAPIConsumer: Calling invokeRemoteMethod:" << objectName << methodName << "args_count:" << args.size() << "timeout:" << timeout.ms;
 
-    LogosObject* plugin = m_transport->requestObject(objectName, timeout.ms);
+    // Reuse a cached handle across calls. Acquiring a QtRO replica per call
+    // (acquireDynamic + waitForSource) is expensive — under a tight loop (e.g. a
+    // proxy forwarding every method to its target) it dominates and can starve
+    // the nested synchronous calls. The handle is kept alive in m_objectCache
+    // and re-acquired only when it goes stale.
+    LogosObject* plugin = acquireCachedObject(objectName, timeout.ms);
     if (!plugin) {
         qWarning() << "LogosAPIConsumer: Failed to acquire plugin/replica for object:" << objectName;
         if (err) {
@@ -128,9 +139,34 @@ QVariant LogosAPIConsumer::invokeRemoteMethod(const QString& authToken, const QS
     }
 
     qDebug() << "[LogosObject] LogosAPIConsumer: calling via LogosObject::callMethod" << methodName;
-    QVariant result = plugin->callMethod(authToken, methodName, args, timeout.ms);
-    plugin->release();
-    return result;
+    // No release() here: the handle stays cached for the next call. Released in
+    // clearObjectCache() (destructor / reconnect) or evicted when stale.
+    return plugin->callMethod(authToken, methodName, args, timeout.ms);
+}
+
+// Get-or-acquire a remote-object handle, transparently refreshing a stale one.
+LogosObject* LogosAPIConsumer::acquireCachedObject(const QString& objectName, int timeoutMs)
+{
+    if (LogosObject* cached = m_objectCache.value(objectName, nullptr)) {
+        if (cached->isValid())
+            return cached;
+        // The source went away (module unloaded / transport dropped) — discard
+        // the dead handle and acquire a fresh one below.
+        qDebug() << "LogosAPIConsumer: cached handle for" << objectName << "went stale; re-acquiring";
+        cached->release();
+        m_objectCache.remove(objectName);
+    }
+    LogosObject* obj = m_transport->requestObject(objectName, timeoutMs);
+    if (obj)
+        m_objectCache.insert(objectName, obj);
+    return obj;
+}
+
+void LogosAPIConsumer::clearObjectCache()
+{
+    for (LogosObject* obj : m_objectCache)
+        if (obj) obj->release();
+    m_objectCache.clear();
 }
 
 void LogosAPIConsumer::invokeRemoteMethodAsync(const QString& authToken, const QString& objectName, const QString& methodName,
@@ -157,7 +193,12 @@ void LogosAPIConsumer::invokeRemoteMethodAsync(const QString& authToken, const Q
         return;
     }
 
-    LogosObject* plugin = m_transport->requestObject(objectName, timeout.ms);
+    // Reuse the cached handle, same as the sync path — repeated async calls to
+    // one object (e.g. a proxy forwarding asynchronously) no longer re-acquire a
+    // replica per call. The handle stays owned by m_objectCache; the callback
+    // must NOT release it (it is shared across in-flight calls and freed only on
+    // eviction/teardown, via release()'s deferred deleteLater).
+    LogosObject* plugin = acquireCachedObject(objectName, timeout.ms);
     if (!plugin) {
         qWarning() << "LogosAPIConsumer: Failed to acquire plugin/replica for object:" << objectName;
         logos::CallError err;
@@ -172,21 +213,14 @@ void LogosAPIConsumer::invokeRemoteMethodAsync(const QString& authToken, const Q
 
     qDebug() << "[LogosObject] LogosAPIConsumer: async calling via LogosObject::callMethodAsync" << methodName;
     // QPointer guards against use-after-free: if the consumer is destroyed
-    // before the transport callback fires, the callback is silently dropped.
-    // No re-queuing needed -- the transport already delivers on a deferred
-    // event-loop iteration (QTimer / QueuedConnection).
+    // before the transport callback fires, the callback is silently dropped and
+    // the handle is released by the destructor's clearObjectCache(), not here.
     QPointer<LogosAPIConsumer> self(this);
     plugin->callMethodAsync(authToken, methodName, args, timeout.ms,
-        [plugin, callback, self](QVariant result) {
-            // Deliver the result before release(): destroying the replica can
-            // invalidate storage that QVariant still references for some return
-            // types (matches sync invokeRemoteMethod: callMethod then release).
-            if (!self) {
-                plugin->release();
+        [callback, self](QVariant result) {
+            if (!self)
                 return;
-            }
             callback(result, logos::CallError{});
-            plugin->release();
         });
 }
 
