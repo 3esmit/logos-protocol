@@ -114,6 +114,16 @@ public:
      * @brief Stable identity value suitable for use as a hash key.
      */
     virtual quintptr id() const = 0;
+
+    /**
+     * @brief Whether this handle is still usable for calls.
+     *
+     * A cached handle can go stale (e.g. its QRemoteObjectReplica lost its
+     * source when the target module unloaded). Callers that keep a handle
+     * across calls should re-acquire when this returns false. Non-owning or
+     * always-live implementations may keep the default.
+     */
+    virtual bool isValid() const { return true; }
 };
 
 #endif // LOGOS_OBJECT_H

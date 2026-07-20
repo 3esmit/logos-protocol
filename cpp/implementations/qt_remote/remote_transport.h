@@ -31,6 +31,12 @@ public:
     bool reconnect() override;
     LogosObject* requestObject(const QString& objectName, int timeoutMs) override;
 
+    // Test hook: how many times requestObject() acquired a fresh replica
+    // (process-wide). Lets a test assert the consumer's handle cache reuses one
+    // replica instead of re-acquiring per call.
+    static long acquireCount();
+    static void resetAcquireCount();
+
 private:
     bool connectToRegistry();
 

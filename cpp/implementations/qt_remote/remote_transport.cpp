@@ -13,6 +13,11 @@
 #include <QTime>
 #include <QJsonArray>
 #include <QVariantMap>
+#include <atomic>
+
+// Process-wide count of replicas acquired by requestObject() — a test hook to
+// prove the consumer reuses one cached handle instead of re-acquiring per call.
+static std::atomic<long> g_acquireCount{0};
 
 // ── RemoteLogosObject ────────────────────────────────────────────────────────
 
@@ -336,6 +341,15 @@ public:
 
     quintptr id() const override { return reinterpret_cast<quintptr>(m_replica); }
 
+    // Valid only while the underlying replica is synced to its source. When the
+    // target module unloads, the source drops and state() leaves Valid, so a
+    // cached handle knows to re-acquire instead of calling into a dead replica.
+    bool isValid() const override
+    {
+        auto* r = qobject_cast<QRemoteObjectReplica*>(m_replica);
+        return r && r->state() == QRemoteObjectReplica::Valid;
+    }
+
 private:
     // Resolve a possibly-deferred result. If `rv` is a pending sentinel from a
     // "multi" provider, wait (up to timeoutMs) for the completion event keyed by
@@ -499,7 +513,11 @@ LogosObject* RemoteTransportConnection::requestObject(const QString& objectName,
     }
 
     qDebug() << "[LogosObject] RemoteTransportConnection: returning RemoteLogosObject for:" << objectName;
+    g_acquireCount.fetch_add(1, std::memory_order_relaxed);
     return new RemoteLogosObject(replica);
 }
+
+long RemoteTransportConnection::acquireCount() { return g_acquireCount.load(std::memory_order_relaxed); }
+void RemoteTransportConnection::resetAcquireCount() { g_acquireCount.store(0, std::memory_order_relaxed); }
 
 #include "remote_transport.moc"

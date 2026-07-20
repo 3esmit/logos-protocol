@@ -21,10 +21,14 @@
 
 #include "logos_object.h"
 #include "logos_async_dispatch.h"
+#include "logos_api_consumer.h"
 #include "logos_instance.h"
+#include "logos_mode.h"
 #include "logos_provider_interface.h"
 #include "module_proxy.h"
 #include "remote_transport.h"
+
+#include <QVector>
 
 #include <QCoreApplication>
 #include <QJsonArray>
@@ -261,4 +265,75 @@ TEST_F(RemoteEventTest, ReleaseFromAsyncCompletionCallbackDoesNotCrash)
     // test also exercises the deferred-teardown path cleanly.
     pumpEventLoop(200);
     // NOTE: obj was already released inside the callback — do not touch it here.
+}
+
+// An echo provider: every call returns its first argument, so a caller can
+// verify results across many calls. Business methods are token-gated by the
+// ModuleProxy in front of it.
+namespace {
+class EchoProvider : public LogosProviderObject {
+public:
+    QVariant callMethod(const QString& method, const QVariantList& args) override {
+        if (method == QLatin1String("echo") && !args.isEmpty())
+            return args.first();
+        return QVariant();
+    }
+    bool informModuleToken(const QString&, const QString&) override { return true; }
+    QJsonArray getMethods() override { return QJsonArray{}; }
+    void setEventListener(EventCallback) override {}
+    void init(void*) override {}
+    QString providerName() const override { return QStringLiteral("echo_module"); }
+    QString providerVersion() const override { return QStringLiteral("1.0.0"); }
+};
+} // namespace
+
+// The consumer must acquire a remote-object handle ONCE and reuse it across
+// calls — both sync and async — instead of re-acquiring (acquireDynamic +
+// waitForSource) per call. Re-acquiring per call made a proxy's rapid forwarding
+// loop ~10x slower and starved the nested synchronous calls (the UI cross-version
+// hang). This drives 2*N calls through a LogosAPIConsumer and asserts exactly
+// one acquisition, with every result correct on both paths.
+TEST_F(RemoteEventTest, ConsumerReusesCachedHandleAcrossSyncAndAsyncCalls)
+{
+    const QString registryUrl = LogosInstance::id("echo_module");
+
+    RemoteTransportHost host(registryUrl);
+    EchoProvider provider;
+    ModuleProxy proxy(&provider);
+    ASSERT_TRUE(proxy.saveToken(QStringLiteral("caller"), QStringLiteral("tok")));
+    ASSERT_TRUE(host.publishObject("echo_module", &proxy));
+
+    // Remote mode → the qt_remote local-socket transport (RemoteTransportConnection,
+    // the same path a UI plugin uses), matching the RemoteTransportHost above.
+    LogosModeConfig::setMode(LogosMode::Remote);
+    LogosAPIConsumer consumer(QStringLiteral("echo_module"), QStringLiteral("caller"),
+                              /*token_manager=*/nullptr);
+
+    RemoteTransportConnection::resetAcquireCount();
+
+    constexpr int N = 12;
+
+    // Sync calls.
+    for (int i = 0; i < N; ++i) {
+        const QVariant r = consumer.invokeRemoteMethod(
+            QStringLiteral("tok"), QStringLiteral("echo_module"),
+            QStringLiteral("echo"), QVariantList{ i });
+        EXPECT_EQ(r.toInt(), i) << "sync echo " << i;
+    }
+
+    // Async calls — fired without waiting between them, then drained.
+    std::atomic<int> done{0};
+    QVector<int> results(N, -1);
+    for (int i = 0; i < N; ++i) {
+        consumer.invokeRemoteMethodAsync(
+            QStringLiteral("tok"), QStringLiteral("echo_module"),
+            QStringLiteral("echo"), QVariantList{ i },
+            [&results, &done, i](QVariant r) { results[i] = r.toInt(); done.fetch_add(1); });
+    }
+    for (int k = 0; k < 1000 && done.load() < N; ++k) pumpEventLoop(5);
+    ASSERT_EQ(done.load(), N);
+    for (int i = 0; i < N; ++i) EXPECT_EQ(results[i], i) << "async echo " << i;
+
+    // The whole point: 2*N calls, but the handle was acquired exactly once.
+    EXPECT_EQ(RemoteTransportConnection::acquireCount(), 1);
 }
