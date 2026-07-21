@@ -203,6 +203,7 @@ install(FILES
     logos_protocol.h
     logos_module_impl.h
     logos_call_error.h
+    logos_rpc_status.h
     logos_types.h
     logos_api_client.h
     logos_api_consumer.h
