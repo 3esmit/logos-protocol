@@ -280,6 +280,21 @@ public:
                  std::function<void(const std::string&, const nlohmann::json&)> callback);
 
 private:
+    // requestModule handshake against capability_module + cache the minted token
+    // in the shared TokenManager. Returns the token ("" on failure). Factors out
+    // the first-exchange logic so both the initial fetch and the
+    // rejection-driven re-exchange share one path. (Private method — no effect on
+    // the ABI-sensitive data layout below.)
+    QString mintAndCacheToken(const QString& objectName);
+
+    // Async invoke with a bounded retry budget backing the public
+    // invokeRemoteMethodAsync overloads. On a provider rejection sentinel it
+    // drops the stale token and re-enters itself with retriesLeft-1, so the retry
+    // coalesces through the same m_pendingHandshakes machinery.
+    void invokeRemoteMethodAsyncImpl(const QString& objectName, const QString& methodName,
+                                     const QVariantList& args, AsyncResultErrorCallback callback,
+                                     Timeout timeout, int retriesLeft);
+
     // ABI note: this private layout is consumed by every plugin that
     // statically links libsdk. Adding a new field in the middle of
     // this section shifts the offsets of subsequent fields and

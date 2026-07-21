@@ -1,6 +1,7 @@
 #include "module_proxy.h"
 #include "logos_provider_interface.h"
 #include "token_manager.h"
+#include "logos_rpc_status.h"
 #include <QDebug>
 #include <QByteArray>
 #include <QJsonObject>
@@ -96,7 +97,12 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
     if (!isAuthorized(authToken)) {
         qWarning() << "ModuleProxy: rejecting unauthorized call to" << methodName
                    << "- auth token not recognized";
-        return QVariant();
+        // Structured rejection instead of a bare QVariant() so a NEW consumer can
+        // drop its stale token and re-exchange (see logos_rpc_status.h /
+        // LogosAPIClient::invokeRemoteMethod). OLD consumers convert this to the
+        // same empty/default they already got from QVariant(), so it's backward
+        // compatible.
+        return logos::makeUnauthorizedSentinel();
     }
 
     // SECURITY: never log call arguments — they routinely carry secrets

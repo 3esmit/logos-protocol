@@ -33,6 +33,13 @@ add_executable(protocol_tests
     # rejected as unauthorized. Post-fix exactly one handshake fires per
     # (client, target) pair.
     test_token_cache.cpp
+    # Rejection-driven token re-exchange: when a provider rejects a call for a
+    # stale/unrecognized token it returns the structured sentinel
+    # (logos_rpc_status.h); the client drops the cached token, re-runs
+    # requestModule and retries once. Covers success, the false-positive guard
+    # (a legit empty return must NOT re-exchange), bounded retry (no loop), and
+    # the async path.
+    test_token_reexchange.cpp
     # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
     # in-process Qt-event-loop deadlock between consumer + provider under
     # nix's test sandbox; exercised cross-process by the integration matrix).

@@ -4,6 +4,7 @@
 #include "logos_types.h"
 #include "logos_json_convert.h"
 #include "logos_thread_marshal.h"
+#include "logos_rpc_status.h"
 #include "token_manager.h"
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -96,22 +97,61 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
     return logos::runOnOwnerThread(this, [&]() -> QVariant {
     qDebug() << "LogosAPIClient: invoking remote method" << objectName << methodName << "args_count:" << args.size();
 
-    QString token = getToken(objectName);
+    const bool eligible = objectName != QStringLiteral("capability_module") && m_capability_consumer;
 
-    if (token.isEmpty() && objectName != "capability_module" && m_capability_consumer) {
-        qDebug() << "LogosAPIClient: calling requestModule for" << objectName;
-        QString capabilityToken = getToken("capability_module");
-        token = QString::fromStdString(
-            m_capability_consumer->requestModule(capabilityToken.toStdString(),
-                                                 m_origin_module.toStdString(),
-                                                 objectName.toStdString()));
-        qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":" << token;
-        // Cache the minted token so subsequent calls skip the handshake — closes the token-rotation race where overlapping requestModule calls mint fresh tokens that overwrite each other at the target (e.g. QtRO's sync wait reentering via a nested event loop).
-        if (!token.isEmpty()) m_token_manager->saveToken(objectName, token);
+    QString token = getToken(objectName);
+    if (token.isEmpty() && eligible)
+        token = mintAndCacheToken(objectName);   // first exchange (cached for later calls)
+
+    QVariant result = m_consumer->invokeRemoteMethod(token, objectName, methodName, args, timeout, err);
+
+    // Re-exchange on rejection, once. The provider rejected our (stale) token —
+    // drop it, mint a fresh one via capability_module, and retry the call. Gated
+    // on the explicit provider sentinel (never a plain empty result), so it can't
+    // loop, can't misfire on a legitimately-empty return, and never fires against
+    // an old provider (which returns a bare QVariant() we don't match). This also
+    // lazily recovers the common provider-reload case. See logos_rpc_status.h.
+    if (eligible && logos::isUnauthorizedSentinel(result)) {
+        qWarning() << "LogosAPIClient: token for" << objectName
+                   << "rejected by provider; re-exchanging and retrying once";
+        m_token_manager->removeToken(objectName);
+        const QString fresh = mintAndCacheToken(objectName);
+        if (!fresh.isEmpty())
+            result = m_consumer->invokeRemoteMethod(fresh, objectName, methodName, args, timeout, err);
     }
 
-    return m_consumer->invokeRemoteMethod(token, objectName, methodName, args, timeout, err);
+    // Never surface the sentinel to the typed wrapper. If we still hold it the
+    // retry failed (capability down / provider truly gone): collapse to today's
+    // empty result, and for NEW callers set a distinguishable CallError.
+    if (logos::isUnauthorizedSentinel(result)) {
+        if (err) {
+            err->code    = "unauthorized";
+            err->message = "call to '" + objectName.toStdString()
+                         + "' rejected: token not recognized (re-exchange failed)";
+            err->origin  = objectName.toStdString();
+        }
+        return QVariant();
+    }
+    return result;
     });
+}
+
+QString LogosAPIClient::mintAndCacheToken(const QString& objectName)
+{
+    qDebug() << "LogosAPIClient: calling requestModule for" << objectName;
+    const QString capabilityToken = getToken(QStringLiteral("capability_module"));
+    const QString token = QString::fromStdString(
+        m_capability_consumer->requestModule(capabilityToken.toStdString(),
+                                             m_origin_module.toStdString(),
+                                             objectName.toStdString()));
+    qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":" << token;
+    // Cache the minted token so subsequent calls skip the handshake — closes the
+    // token-rotation race where overlapping requestModule calls mint fresh tokens
+    // that overwrite each other at the target (e.g. QtRO's sync wait reentering
+    // via a nested event loop).
+    if (!token.isEmpty())
+        m_token_manager->saveToken(objectName, token);
+    return token;
 }
 
 QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QString& methodName,
@@ -163,26 +203,68 @@ void LogosAPIClient::invokeRemoteMethodAsync(const QString& objectName, const QS
                                               const QVariantList& args, AsyncResultErrorCallback callback,
                                               Timeout timeout)
 {
+    // Public entry: grant one retry for the rejection-driven re-exchange.
+    invokeRemoteMethodAsyncImpl(objectName, methodName, args, std::move(callback), timeout, /*retriesLeft=*/1);
+}
+
+void LogosAPIClient::invokeRemoteMethodAsyncImpl(const QString& objectName, const QString& methodName,
+                                                 const QVariantList& args, AsyncResultErrorCallback callback,
+                                                 Timeout timeout, int retriesLeft)
+{
     if (!callback) return;
 
     // The async path acquires a replica too, so it must also run on the owner
     // thread. Unlike the sync path we post non-blocking (QueuedConnection): the
     // worker caller returns immediately and the result callback fires on the
-    // owner thread when the reply arrives.
+    // owner thread when the reply arrives. Preserve retriesLeft across the hop.
     if (QThread::currentThread() != this->thread()) {
         QMetaObject::invokeMethod(this,
             [this, objectName, methodName, args,
-             callback = std::move(callback), timeout]() mutable {
-                invokeRemoteMethodAsync(objectName, methodName, args,
-                                        std::move(callback), timeout);
+             callback = std::move(callback), timeout, retriesLeft]() mutable {
+                invokeRemoteMethodAsyncImpl(objectName, methodName, args,
+                                            std::move(callback), timeout, retriesLeft);
             },
             Qt::QueuedConnection);
         return;
     }
 
+    const bool eligible = objectName != QStringLiteral("capability_module") && m_capability_consumer;
+
+    // Wrap the user callback so a provider rejection sentinel triggers one
+    // re-exchange + retry, and the sentinel is never surfaced to the caller.
+    // Mirrors the sync path's retry in logos_api_client.cpp's invokeRemoteMethod.
+    QPointer<LogosAPIClient> selfGuard(this);
+    AsyncResultErrorCallback onResult =
+        [this, selfGuard, objectName, methodName, args, timeout, retriesLeft, cb = std::move(callback)]
+        (QVariant result, const logos::CallError& err) mutable {
+            if (!selfGuard) return;   // client destroyed mid-flight: drop
+            if (retriesLeft > 0 && objectName != QStringLiteral("capability_module")
+                && m_capability_consumer && logos::isUnauthorizedSentinel(result)) {
+                qWarning() << "LogosAPIClient: token for" << objectName
+                           << "rejected by provider (async); re-exchanging and retrying once";
+                m_token_manager->removeToken(objectName);
+                // Token is empty now → the re-entry coalesces the retry through the
+                // same m_pendingHandshakes machinery, so a burst of concurrent
+                // rejections doesn't restorm capability_module with N handshakes.
+                invokeRemoteMethodAsyncImpl(objectName, methodName, args,
+                                            std::move(cb), timeout, retriesLeft - 1);
+                return;
+            }
+            if (logos::isUnauthorizedSentinel(result)) {
+                logos::CallError e;
+                e.code    = "unauthorized";
+                e.message = "call to '" + objectName.toStdString()
+                          + "' rejected: token not recognized (re-exchange failed)";
+                e.origin  = objectName.toStdString();
+                cb(QVariant(), e);
+                return;
+            }
+            cb(std::move(result), err);
+        };
+
     QString token = getToken(objectName);
 
-    if (token.isEmpty() && objectName != "capability_module" && m_capability_consumer) {
+    if (token.isEmpty() && eligible) {
         // Async-chain: dispatch the requestModule call asynchronously, and only
         // fire the real method's invokeRemoteMethodAsync from its callback. The
         // previous version called `requestModule` synchronously here, which made
@@ -200,7 +282,7 @@ void LogosAPIClient::invokeRemoteMethodAsync(const QString& objectName, const QS
         // never overlap.) m_pendingHandshakes is touched only on the owner
         // thread, reached above, so no lock is needed.
         m_pendingHandshakes[objectName].push_back(
-            [this, objectName, methodName, args, timeout, cb = std::move(callback)]
+            [this, objectName, methodName, args, timeout, cb = std::move(onResult)]
             (const QString& tok) mutable {
                 m_consumer->invokeRemoteMethodAsync(tok, objectName, methodName, args,
                                                     std::move(cb), timeout);
@@ -240,7 +322,7 @@ void LogosAPIClient::invokeRemoteMethodAsync(const QString& objectName, const QS
         return;
     }
 
-    m_consumer->invokeRemoteMethodAsync(token, objectName, methodName, args, std::move(callback), timeout);
+    m_consumer->invokeRemoteMethodAsync(token, objectName, methodName, args, std::move(onResult), timeout);
 }
 
 void LogosAPIClient::invokeRemoteMethodAsync(const QString& objectName, const QString& methodName,
