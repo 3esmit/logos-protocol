@@ -339,7 +339,16 @@ bool LogosAPIClient::informModuleToken(const std::string& authToken, const std::
 
 bool LogosAPIClient::informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token)
 {
-    return m_consumer->informModuleToken_module(authToken, originModule, moduleName, token);
+    // Marshal onto the owner (module main/event-loop) thread, like
+    // invokeRemoteMethod above: this acquires a QtRO replica for originModule and
+    // spins a nested event loop, and QtRO replicas only work on the thread that
+    // created the consumer. Needed because a concurrency:"multi" provider (e.g.
+    // capability_module's requestModule) runs its handler on a worker thread and
+    // calls this to inform the target — without the hop that would touch the
+    // main-thread consumer from the worker. Same-thread callers run inline.
+    return logos::runOnOwnerThread(this, [&]() -> bool {
+        return m_consumer->informModuleToken_module(authToken, originModule, moduleName, token);
+    });
 }
 
 TokenManager* LogosAPIClient::getTokenManager() const
