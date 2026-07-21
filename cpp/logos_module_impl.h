@@ -66,9 +66,10 @@ typedef void (*logos_module_emit_cb)(const char* event_name,
  * borrowed; get_token's returned char* is HOST-allocated and freed by free_fn.
  * ------------------------------------------------------------------------- */
 
-/* Return the host's stored auth token for `module_name`, or NULL / "" when the
- * module is unknown. Host-allocated; the caller frees it with the bridge's
- * free_fn. */
+/* Return the host's stored auth token for `module_name`, or NULL when the
+ * module is unknown. Any NON-NULL return (including an empty string) is
+ * host-allocated and the caller MUST free it with the bridge's free_fn — never
+ * return a string literal. "Unknown" is signalled only by NULL. */
 typedef char* (*logos_module_get_token_fn)(void* user_data,
                                            const char* module_name);
 
@@ -119,9 +120,16 @@ LOGOS_MODULE_IMPL_EXPORT int logos_module_accept_token(const char* module_name,
 
 /* Install the host's token-bridge callbacks (see the typedefs above). Only a
  * token-authority module (capability_module, via LogosTokenManagerContext)
- * uses them; every other module ignores the bridge. Passing NULLs clears it.
- * Additive/opt-in: an old host that doesn't call this leaves the module's
- * bridge unset, and the SDK base's accessors then no-op. */
+ * uses them; every other module ignores the bridge. Additive/opt-in: an old
+ * host that never calls this leaves the bridge unset and the SDK base's
+ * accessors no-op.
+ *
+ * Threading, matching logos_module_set_emit_callback: the module may invoke the
+ * installed callbacks from ANY module thread (a concurrency:"multi" handler runs
+ * on a worker), so the host implementation must be thread-safe / marshal as
+ * needed. The module keeps (callbacks, user_data) until the next call replaces
+ * them. Passing all-NULL clears the bridge; after that call returns the module
+ * must not invoke the old pointers. */
 LOGOS_MODULE_IMPL_EXPORT void logos_module_set_token_bridge(
     logos_module_get_token_fn get_token,
     logos_module_inform_token_fn inform_token,
