@@ -35,6 +35,8 @@ set(PROTOCOL_SOURCES
     token_manager.h
     logos_mode.h
     logos_instance.h
+    logos_socket_paths.h
+    logos_socket_paths.cpp
     plugin_registry.h
     logos_object.h
     logos_thread_marshal.h
@@ -211,6 +213,7 @@ install(FILES
     token_manager.h
     logos_mode.h
     logos_instance.h
+    logos_socket_paths.h
     plugin_registry.h
     logos_object.h
     logos_thread_marshal.h
