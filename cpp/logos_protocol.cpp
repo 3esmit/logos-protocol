@@ -15,6 +15,7 @@
 #include <QJsonDocument>
 #include <QMetaType>
 #include <QString>
+#include <QThread>
 #include <QVariant>
 #include <QVariantList>
 
@@ -213,7 +214,31 @@ void lp_client_destroy(lp_client* client)
         std::lock_guard<std::recursive_mutex> lock(client->guard->mutex);
         client->guard->alive = false;
     }
-    delete client->client;
+    // The client and its consumers own Qt transport objects (for QtRO: a node
+    // and its QLocalSocket, with socket notifiers) that belong to the owner
+    // thread. Destroying them from another thread makes Qt disable a notifier
+    // cross-thread and closes the fd under the owner's event dispatcher, which
+    // faults. Foreign-thread destroys are real: any binding that keeps a client
+    // share inside a worker (an event subscription moved into a Rust worker
+    // thread, say) runs this on that worker when the last share drops.
+    //
+    // deleteLater() hands the destruction to the owner thread, matching the
+    // marshaling every call path already does (logos::runOnOwnerThread). A
+    // *blocking* marshal is not usable here: the owner thread is typically the
+    // module's dispatch thread, and it may be blocked joining the very worker
+    // running this destroy — that would deadlock. Deferring instead is
+    // invisible to callers because the guard above, not the delete, is what
+    // enforces the ABI's "no callbacks after this returns" contract.
+    //
+    // If the owner's event loop never runs again (a process already tearing
+    // down), the deferred delete never fires and the client leaks. That is the
+    // deliberate trade: a leak at exit beats a crash.
+    if (client->client) {
+        if (client->client->thread() == QThread::currentThread())
+            delete client->client;
+        else
+            client->client->deleteLater();
+    }
     delete client;
 }
 

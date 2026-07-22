@@ -42,6 +42,11 @@
  *   - After lp_client_destroy() / lp_unsubscribe() RETURNS, no further
  *     callbacks fire for that handle; pending async results are dropped.
  *     `user_data` may be freed only after that point, never before.
+ *   - Both are safe to call from ANY thread, including a worker that happens
+ *     to drop the last reference to a client. lp_client_destroy() defers the
+ *     underlying teardown to the client's owner thread when called elsewhere,
+ *     so the handle may outlive the call by an event-loop turn — the
+ *     no-callbacks guarantee above holds regardless.
  *
  * Versioning: this library carries the logos-protocol semantic version —
  * the single number that governs Logos load/call compatibility. Two

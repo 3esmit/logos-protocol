@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <string>
+#include <thread>
 
 #include <nlohmann/json.hpp>
 
@@ -152,6 +153,40 @@ TEST_F(LpClientTest, InvokeAsyncDeliversResult)
     ASSERT_TRUE(capture.done) << "async result not delivered within 5s";
     EXPECT_EQ(capture.ok, 1);
     EXPECT_DOUBLE_EQ(parsed(capture.json.c_str()).get<double>(), 7.0);
+}
+
+TEST_F(LpClientTest, DestroyFromWorkerThreadIsSafe)
+{
+    // A client share can outlive its creator inside a worker — a Rust event
+    // subscription moved into a bridge thread, say — so the last drop, and
+    // with it this destroy, can land on a thread that does not own the
+    // client's Qt objects. Destroying them there tore the transport's socket
+    // notifiers down cross-thread and faulted the owner's event loop.
+    //
+    // Scope: the mock transport has no sockets, so this pins the ABI contract
+    // (a foreign-thread destroy is legal, terminates, and leaves the client
+    // machinery usable) rather than reproducing the QtRO fault itself.
+    m_mock->when("mod", "compute").thenReturn(QVariant(7));
+
+    lp_client* client = lp_client_create("mod", "origin", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+
+    std::thread worker([client]() { lp_client_destroy(client); });
+    worker.join();
+
+    // Let the owner thread run the teardown the destroy deferred to it.
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+
+    // The machinery survives: a fresh client for the same target still works.
+    lp_client* revived = lp_client_create("mod", "origin", nullptr, nullptr);
+    ASSERT_NE(revived, nullptr);
+    LpClientGuard guard(revived);
+
+    char* result = nullptr;
+    ASSERT_EQ(lp_invoke(revived, "compute", "[]", 0, &result, nullptr), LP_OK);
+    ASSERT_NE(result, nullptr);
+    EXPECT_DOUBLE_EQ(parsed(result).get<double>(), 7.0);
+    lp_string_free(result);
 }
 
 TEST_F(LpClientTest, InvalidArgsJsonIsRejected)
