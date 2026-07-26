@@ -7,6 +7,11 @@ add_executable(protocol_tests
     test_json_convert_bytes.cpp
     test_universal_provider_dispatch.cpp
     test_lp_client.cpp
+    # Owner-thread anchoring for lp clients: a client created from a worker
+    # thread (the generated bind_<iface>() wrapper is lazy, so the first caller
+    # wins) must still be serviced by the Qt main thread's event loop instead of
+    # falling out on replica-acquire timeouts.
+    test_lp_client_owner_thread.cpp
     test_call_error.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp

@@ -54,6 +54,23 @@ namespace LogosTransportFactory {
      */
     std::unique_ptr<LogosTransportConnection> createConnection(const QString& registryUrl);
 
+    /**
+     * @brief Whether a connection resolved from `cfg` owns Qt objects that only
+     * work on a thread running a Qt event loop.
+     *
+     * True for the qt_remote (LocalSocket) transport — a QRemoteObjectNode plus
+     * its QLocalSocket, whose replica acquisition and reply delivery both ride
+     * the owning thread's event loop — and for the in-process qt_local
+     * transport, which invokes on QObjects living on the module's main thread.
+     * False for the plain Tcp/TcpSsl transports (Qt-free by design) and for
+     * Mock (no sockets at all).
+     *
+     * Callers use this to decide *which thread must construct* a client: see
+     * lp_client_create(). Mirrors the createConnection resolution rule above —
+     * keep the two in sync.
+     */
+    bool needsQtEventLoop(const LogosTransportConfig& cfg);
+
 }
 
 #endif // LOGOS_TRANSPORT_FACTORY_H

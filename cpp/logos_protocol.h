@@ -35,6 +35,10 @@
  *     processes) ADDITIONALLY requires a running Qt event loop in the
  *     process. Every Logos module process has one (logos_host runs it).
  *     Standalone non-Qt consumers must use the plain transport.
+ *     A client on that transport is created on — and owned by — the Qt main
+ *     thread no matter which thread calls lp_client_create(), because its
+ *     node and socket are only serviced by that thread's loop. Calls from
+ *     other threads marshal onto it and block until it answers.
  *   - lp_invoke() blocks the calling thread until the result arrives or the
  *     timeout elapses (timeout_ms <= 0 selects the default, currently 20s).
  *
@@ -144,9 +148,13 @@ typedef void (*lp_event_cb)(const char* event_name, const char* data_json,
  * flow (this library dials `capability_module` transparently the first time
  * a target requires a token — every language gets that flow for free).
  *
- * The calling thread becomes the client's owner thread; with the Qt Remote
- * Objects transport it must run a Qt event loop. Returns NULL on invalid
- * arguments.
+ * Owner thread: for a Qt-affine transport (Qt Remote Objects / local mode) the
+ * client is constructed on the Qt main thread — blocking this call until that
+ * thread runs it — because its node and socket are only serviced there. Any
+ * thread may call this. For the Qt-free transports (tcp / tcp_ssl / mock) the
+ * calling thread becomes the owner thread, as before.
+ *
+ * Returns NULL on invalid arguments.
  */
 lp_client* lp_client_create(const char* target_module,
                             const char* origin_module,

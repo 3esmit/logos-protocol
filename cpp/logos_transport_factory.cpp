@@ -78,4 +78,26 @@ std::unique_ptr<LogosTransportConnection> createConnection(const QString& regist
     return createConnection(LogosTransportConfigGlobal::getDefault(), registryUrl);
 }
 
+// Same resolution rule as createConnection, answering "does the connection this
+// cfg resolves to have to live on a thread with a Qt event loop?".
+//   Local      → LocalTransportConnection: invokes in-process QObjects owned by
+//                the module's main thread.                            → yes
+//   Mock       → MockTransportConnection: no Qt objects, no sockets.  → no
+//   LocalSocket→ RemoteTransportConnection: QRemoteObjectNode + QLocalSocket;
+//                acquire and reply delivery both need the owner's loop. → yes
+//   Tcp/TcpSsl → PlainTransportConnection: Qt-free by design.         → no
+bool needsQtEventLoop(const LogosTransportConfig& cfg)
+{
+    if (LogosModeConfig::isLocal()) return true;
+    if (LogosModeConfig::isMock()) return false;
+    switch (cfg.protocol) {
+    case LogosProtocol::Tcp:
+    case LogosProtocol::TcpSsl:
+        return false;
+    case LogosProtocol::LocalSocket:
+    default:
+        return true;
+    }
+}
+
 }
