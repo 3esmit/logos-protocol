@@ -59,6 +59,37 @@ TEST_F(TransportFactoryTest, LocalModeCreatesConnection)
     EXPECT_TRUE(conn->isConnected());
 }
 
+// needsQtEventLoop mirrors the createConnection resolution rule: it answers
+// "must this connection be owned by a thread running a Qt event loop?". It is
+// what lp_client_create() consults to decide whether to anchor a client to the
+// Qt main thread, so a wrong answer here is either a hang (missing anchor) or
+// a needless main-thread hop for a Qt-free transport.
+TEST_F(TransportFactoryTest, NeedsQtEventLoopFollowsTheResolutionRule)
+{
+    LogosTransportConfig localSocket;      // default protocol
+    localSocket.protocol = LogosProtocol::LocalSocket;
+    LogosTransportConfig tcp;
+    tcp.protocol = LogosProtocol::Tcp;
+    LogosTransportConfig tcpSsl;
+    tcpSsl.protocol = LogosProtocol::TcpSsl;
+
+    LogosModeConfig::setMode(LogosMode::Remote);
+    EXPECT_TRUE(LogosTransportFactory::needsQtEventLoop(localSocket))
+        << "qt_remote owns a QRemoteObjectNode + QLocalSocket";
+    EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(tcp))
+        << "the plain transport is Qt-free by design";
+    EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(tcpSsl));
+
+    // Mode wins over cfg.protocol, exactly as in createConnection.
+    LogosModeConfig::setMode(LogosMode::Local);
+    EXPECT_TRUE(LogosTransportFactory::needsQtEventLoop(tcp))
+        << "local mode invokes in-process QObjects owned by the main thread";
+
+    LogosModeConfig::setMode(LogosMode::Mock);
+    EXPECT_FALSE(LogosTransportFactory::needsQtEventLoop(localSocket))
+        << "mock has no Qt objects and no sockets";
+}
+
 TEST_F(TransportFactoryTest, ModeSwitchChangesTransportType)
 {
     LogosModeConfig::setMode(LogosMode::Mock);

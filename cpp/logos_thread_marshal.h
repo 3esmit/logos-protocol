@@ -2,7 +2,9 @@
 #define LOGOS_THREAD_MARSHAL_H
 
 #include <type_traits>
+#include <utility>
 
+#include <QCoreApplication>
 #include <QMetaObject>
 #include <QObject>
 #include <QThread>
@@ -44,6 +46,31 @@ auto runOnOwnerThread(QObject* obj, Fn&& fn) -> decltype(fn())
         QMetaObject::invokeMethod(obj, [&]() { ret = fn(); }, Qt::BlockingQueuedConnection);
         return ret;
     }
+}
+
+// Run `fn` on the process's Qt main thread — the QCoreApplication's thread,
+// the one thread guaranteed to be running an event loop for the life of a
+// module — and forward the return value.
+//
+// Why this exists separately from runOnOwnerThread: that one marshals to an
+// object's *existing* owner thread, which presupposes the object was created
+// somewhere sane. This one is for deciding where to create it in the first
+// place. A Qt-affine transport (see LogosTransportFactory::needsQtEventLoop)
+// binds its node/socket to whichever thread constructs it, so construction on
+// a worker thread — an HTTP handler making the module's first outbound call,
+// say — permanently binds the client to a thread that only pumps events while
+// it happens to be blocked inside a call. Replica acquisition then never
+// completes and every call burns its full timeout.
+//
+// Falls back to running inline when there is no QCoreApplication (a pure-lp
+// host with no Qt loop — there is no better thread to pick) or when already on
+// the main thread (the common case: module init, and any call made from it).
+template <typename Fn>
+auto runOnQtMainThread(Fn&& fn) -> decltype(fn())
+{
+    QCoreApplication* app = QCoreApplication::instance();
+    if (!app) return fn();
+    return runOnOwnerThread(app, std::forward<Fn>(fn));
 }
 
 }  // namespace logos

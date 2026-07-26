@@ -4,13 +4,17 @@
 #include "logos_json_convert.h"
 #include "logos_mode.h"
 #include "logos_object.h"
+#include "logos_thread_marshal.h"
 #include "logos_transport_config.h"
 #include "logos_transport_config_json.h"
+#include "logos_transport_factory.h"
 #include "logos_types.h"
 #include "token_manager.h"
 
 #include <nlohmann/json.hpp>
 
+#include <QCoreApplication>
+#include <QDebug>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QMetaType>
@@ -198,11 +202,46 @@ lp_client* lp_client_create(const char* target_module,
     handle->target = QString::fromUtf8(target_module);
     handle->origin = QString::fromUtf8(origin_module);
     handle->guard = std::make_shared<CbGuard>();
-    // No QObject parent: the handle owns the client. Constructed on the
-    // calling thread, which becomes the owner thread (see header contract).
-    handle->client = new LogosAPIClient(handle->target, handle->origin,
-                                        &TokenManager::instance(),
-                                        targetCfg, capabilityCfg);
+
+    // No QObject parent: the handle owns the client.
+    //
+    // Construction picks the owner thread every later call marshals onto
+    // (logos::runOnOwnerThread), and for a Qt-affine transport it also picks
+    // the thread that owns the QRemoteObjectNode and its QLocalSocket. Those
+    // only work on a thread running a Qt event loop, so we construct on the Qt
+    // main thread rather than on whichever thread happened to call first.
+    //
+    // Callers reach lp_client_create through a lazily-created wrapper (the
+    // generated bind_<iface>() → LpClient::ensure()), so "whichever thread
+    // called first" is genuinely arbitrary: a module whose first outbound call
+    // comes from an HTTP handler used to bind its whole transport to that
+    // worker thread. The worker only pumps events while blocked inside a call,
+    // so replica acquisition never completed and every call burned its full
+    // 20s timeout — silently, since a failed acquire returns an empty result.
+    // The Qt path never had this: LogosAPI::getClient marshals construction to
+    // the LogosAPI's thread, which is the main thread. This gives the lp path
+    // the same anchor.
+    //
+    // Plain (Tcp/TcpSsl) and mock transports are Qt-free and thread-agnostic —
+    // they keep the calling thread, so a worker-thread consumer stays off the
+    // main thread's back.
+    const bool qtAffine = LogosTransportFactory::needsQtEventLoop(targetCfg)
+                       || LogosTransportFactory::needsQtEventLoop(capabilityCfg);
+    auto construct = [&]() -> LogosAPIClient* {
+        return new LogosAPIClient(handle->target, handle->origin,
+                                  &TokenManager::instance(),
+                                  targetCfg, capabilityCfg);
+    };
+    if (qtAffine && !QCoreApplication::instance()) {
+        // Nothing to anchor to. The transport will misbehave for the reasons
+        // above; say so once rather than let it surface as a mute timeout.
+        qWarning() << "lp_client_create: creating a Qt-affine client for"
+                   << handle->target
+                   << "with no QCoreApplication — the QtRO transport needs a "
+                      "Qt event loop; use a plain (tcp) transport in Qt-free "
+                      "hosts";
+    }
+    handle->client = qtAffine ? logos::runOnQtMainThread(construct) : construct();
     return handle;
 }
 
