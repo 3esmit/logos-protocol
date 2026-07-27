@@ -204,6 +204,9 @@ install(FILES
 install(FILES
     logos_protocol.h
     logos_module_impl.h
+    # The canonical LIDL <-> JSON codec. Generated module glue includes it, so it
+    # has to ship with the library's headers, not just in the source export.
+    logos_codec.h
     logos_call_error.h
     logos_rpc_status.h
     logos_types.h
