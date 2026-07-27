@@ -139,6 +139,43 @@ inline std::vector<uint8_t> b64UrlDecode(const std::string& in)
     return out;
 }
 
+// Strict variant: returns false on any character outside the alphabet (padding
+// aside) or an impossible length, leaving `out` empty. The plain wire validates
+// its frames with this — a corrupt frame must be rejected, not silently decoded
+// to fewer bytes. Consumer-facing decodes use the tolerant one above.
+inline bool b64UrlDecodeChecked(const std::string& in, std::vector<uint8_t>& out)
+{
+    auto idx = [](char ch) -> int {
+        if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+        if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+        if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+        if (ch == '-') return 62;
+        if (ch == '_') return 63;
+        return -1;
+    };
+    out.clear();
+    std::string body = in;
+    while (!body.empty() && body.back() == '=') body.pop_back();
+    if (body.size() % 4 == 1) return false;
+
+    uint32_t buf = 0;
+    int bits = 0;
+    for (char ch : body) {
+        const int v = idx(ch);
+        if (v < 0) {
+            out.clear();
+            return false;
+        }
+        buf = (buf << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((buf >> bits) & 0xff));
+        }
+    }
+    return true;
+}
+
 // ── tagged bytes ───────────────────────────────────────────────────────────
 
 inline nlohmann::json bytesToJson(const std::vector<uint8_t>& bytes)

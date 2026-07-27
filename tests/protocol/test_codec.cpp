@@ -200,3 +200,23 @@ TEST(Codec, MismatchThrowsWithPath)
         EXPECT_NE(std::string(e.what()).find(".k"), std::string::npos) << e.what();
     }
 }
+
+// The plain wire validates frames with the strict decode: a corrupt base64 body
+// must be rejected, not silently decoded to fewer bytes. Consumer-facing decodes
+// stay tolerant (PaddedBase64Decodes above), so both behaviours come from one
+// implementation instead of four disagreeing copies.
+TEST(Codec, CheckedDecodeRejectsCorruptInput)
+{
+    std::vector<uint8_t> out;
+    EXPECT_TRUE(logos::b64UrlDecodeChecked("AH-A_w", out));
+    EXPECT_EQ(out, kSpan);
+
+    EXPECT_TRUE(logos::b64UrlDecodeChecked("AH-A_w==", out));  // padding tolerated
+    EXPECT_EQ(out, kSpan);
+
+    EXPECT_FALSE(logos::b64UrlDecodeChecked("AH-A_w!!", out)); // stray character
+    EXPECT_TRUE(out.empty());
+
+    EXPECT_FALSE(logos::b64UrlDecodeChecked("AH-A_wQQQ??", out));
+    EXPECT_FALSE(logos::b64UrlDecodeChecked("A", out));        // impossible length
+}

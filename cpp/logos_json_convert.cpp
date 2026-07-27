@@ -1,4 +1,6 @@
 #include "logos_json_convert.h"
+
+#include "logos_codec.h"
 #include "logos_types.h"
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -15,26 +17,20 @@ namespace {
 // Matches the plain wire's encoding (implementations/plain/json_mapping.cpp);
 // Qt's Base64UrlEncoding|OmitTrailingEquals produces the identical alphabet
 // and padding-free form.
+// Delegates to the canonical codec so the Qt consumer path cannot drift from the
+// wire or from the providers: same alphabet, same padding rule, same single-key
+// shape. Only the QByteArray <-> std::vector<uint8_t> hop lives here.
 nlohmann::json byteArrayToTaggedJson(const QByteArray& bytes)
 {
-    nlohmann::json obj;
-    obj["_bytes"] = bytes.toBase64(QByteArray::Base64UrlEncoding
-                                   | QByteArray::OmitTrailingEquals)
-                         .toStdString();
-    return obj;
-}
-
-bool isTaggedBytes(const nlohmann::json& j)
-{
-    return j.is_object() && j.size() == 1 && j.contains("_bytes")
-        && j["_bytes"].is_string();
+    const auto* p = reinterpret_cast<const uint8_t*>(bytes.constData());
+    return logos::bytesToJson(std::vector<uint8_t>(p, p + bytes.size()));
 }
 
 QByteArray taggedJsonToByteArray(const nlohmann::json& j)
 {
-    return QByteArray::fromBase64(
-        QByteArray::fromStdString(j["_bytes"].get<std::string>()),
-        QByteArray::Base64UrlEncoding);
+    const std::vector<uint8_t> bytes = logos::bytesFromJson(j);
+    return QByteArray(reinterpret_cast<const char*>(bytes.data()),
+                      static_cast<qsizetype>(bytes.size()));
 }
 
 } // namespace
