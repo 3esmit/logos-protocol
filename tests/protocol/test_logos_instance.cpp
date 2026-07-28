@@ -53,3 +53,13 @@ TEST_F(LogosInstanceTest, RegistryUrlFormat)
     QString url = LogosInstance::id("my_module");
     EXPECT_EQ(url, "local:logos_my_module_abc123def456");
 }
+
+TEST_F(LogosInstanceTest, ExplicitInstanceRegistryUrlFormat)
+{
+    qputenv("LOGOS_INSTANCE_ID", "shared_root");
+
+    EXPECT_EQ(LogosInstance::id("my_module", "zone_alpha"),
+              "local:logos_my_module_zone_alpha");
+    EXPECT_EQ(LogosInstance::id("my_module", QString{}),
+              "local:logos_my_module_shared_root");
+}

@@ -27,6 +27,16 @@ namespace LogosInstance {
     inline QString id(const QString& moduleName) {
         return QString("local:logos_%1_%2").arg(moduleName).arg(id());
     }
+
+    // An explicit module-instance ID selects a distinct local registry while
+    // retaining the existing shared-process ID when no instance is supplied.
+    // The caller owns validation: this protocol helper deliberately accepts
+    // the address vocabulary chosen by its host runtime.
+    inline QString id(const QString& moduleName, const QString& instanceId) {
+        return QString("local:logos_%1_%2")
+            .arg(moduleName)
+            .arg(instanceId.isEmpty() ? id() : instanceId);
+    }
 }
 
 #endif // LOGOS_INSTANCE_H

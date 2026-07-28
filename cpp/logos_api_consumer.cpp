@@ -836,8 +836,19 @@ LogosAPIConsumer::LogosAPIConsumer(const QString& module_to_talk_to,
                                    TokenManager* token_manager,
                                    const LogosTransportConfig& transport,
                                    QObject *parent)
+    : LogosAPIConsumer(module_to_talk_to, origin_module, token_manager,
+                       transport, QString{}, parent)
+{
+}
+
+LogosAPIConsumer::LogosAPIConsumer(const QString& module_to_talk_to,
+                                   const QString& origin_module,
+                                   TokenManager* token_manager,
+                                   const LogosTransportConfig& transport,
+                                   const QString& target_instance_id,
+                                   QObject *parent)
     : QObject(parent)
-    , m_registryUrl(LogosInstance::id(module_to_talk_to))
+    , m_registryUrl(LogosInstance::id(module_to_talk_to, target_instance_id))
     // Same NULL-means-the-origin's-store rule as LogosAPIClient, so a consumer
     // built directly (rather than through a client) carries the identity's store
     // too. m_token_manager is currently never READ at this layer — the store is
@@ -881,6 +892,17 @@ LogosAPIConsumer::LogosAPIConsumer(const QString& module_to_talk_to,
                                    QObject *parent)
     : LogosAPIConsumer(module_to_talk_to, origin_module, token_manager,
                        LogosTransportConfigGlobal::getDefault(), parent)
+{
+}
+
+LogosAPIConsumer::LogosAPIConsumer(const QString& module_to_talk_to,
+                                   const QString& origin_module,
+                                   TokenManager* token_manager,
+                                   const QString& target_instance_id,
+                                   QObject *parent)
+    : LogosAPIConsumer(module_to_talk_to, origin_module, token_manager,
+                       LogosTransportConfigGlobal::getDefault(),
+                       target_instance_id, parent)
 {
 }
 

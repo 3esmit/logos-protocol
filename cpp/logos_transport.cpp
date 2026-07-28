@@ -6,14 +6,14 @@
 // They match today's deterministic scheme in LogosInstance::id(moduleName);
 // network backends (plain_transport_host, plain_transport_connection) override.
 
-QString LogosTransportHost::bindUrl(const QString& /*instanceId*/,
+QString LogosTransportHost::bindUrl(const QString& instanceId,
                                     const QString& moduleName)
 {
-    return LogosInstance::id(moduleName);
+    return LogosInstance::id(moduleName, instanceId);
 }
 
-QString LogosTransportConnection::endpointUrl(const QString& /*instanceId*/,
+QString LogosTransportConnection::endpointUrl(const QString& instanceId,
                                               const QString& moduleName)
 {
-    return LogosInstance::id(moduleName);
+    return LogosInstance::id(moduleName, instanceId);
 }
