@@ -7,6 +7,11 @@ add_executable(protocol_tests
     test_json_convert_bytes.cpp
     test_universal_provider_dispatch.cpp
     test_lp_client.cpp
+    # The canonical LIDL <-> JSON codec (cpp/logos_codec.h): one implementation
+    # of an encoding that used to exist six times with divergent semantics.
+    # Pins the contract — accepted shapes, rejected shapes, and bytes staying
+    # tagged at any nesting depth.
+    test_codec.cpp
     # Owner-thread anchoring for lp clients: a client created from a worker
     # thread (the generated bind_<iface>() wrapper is lazy, so the first caller
     # wins) must still be serviced by the Qt main thread's event loop instead of
