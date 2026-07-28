@@ -51,6 +51,17 @@ public:
                    const LogosTransportConfig& capability_transport,
                    QObject *parent = nullptr);
 
+    // Explicit target-instance variant. The capability module remains on the
+    // default host instance; only the requested target endpoint is scoped.
+    // Logical object names and generated module signatures remain unchanged.
+    LogosAPIClient(const QString& module_to_talk_to,
+                   const QString& origin_module,
+                   TokenManager* token_manager,
+                   const LogosTransportConfig& target_transport,
+                   const LogosTransportConfig& capability_transport,
+                   const QString& target_instance_id,
+                   QObject *parent = nullptr);
+
     /**
      * @brief No-transport constructor — both target and
      * capability_module use the process-global default
@@ -60,6 +71,12 @@ public:
                             const QString& origin_module,
                             TokenManager* token_manager,
                             QObject *parent = nullptr);
+
+    LogosAPIClient(const QString& module_to_talk_to,
+                   const QString& origin_module,
+                   TokenManager* token_manager,
+                   const QString& target_instance_id,
+                   QObject *parent = nullptr);
     ~LogosAPIClient();
 
     /**

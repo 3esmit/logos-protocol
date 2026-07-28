@@ -19,6 +19,7 @@ add_executable(protocol_tests
     test_mock_transport.cpp
     test_logos_mode.cpp
     test_logos_instance.cpp
+    test_instance_endpoints.cpp
     test_plugin_registry.cpp
     test_transport_factory.cpp
     test_registry_factory.cpp
