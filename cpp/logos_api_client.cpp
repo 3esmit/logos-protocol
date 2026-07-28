@@ -24,9 +24,22 @@ LogosAPIClient::LogosAPIClient(const QString& module_to_talk_to,
                                const LogosTransportConfig& target_transport,
                                const LogosTransportConfig& capability_transport,
                                QObject *parent)
+    : LogosAPIClient(module_to_talk_to, origin_module, token_manager,
+                     target_transport, capability_transport, QString{}, parent)
+{
+}
+
+LogosAPIClient::LogosAPIClient(const QString& module_to_talk_to,
+                               const QString& origin_module,
+                               TokenManager* token_manager,
+                               const LogosTransportConfig& target_transport,
+                               const LogosTransportConfig& capability_transport,
+                               const QString& target_instance_id,
+                               QObject *parent)
     : QObject(parent)
     , m_consumer(new LogosAPIConsumer(module_to_talk_to, origin_module,
-                                      token_manager, target_transport, this))
+                                      token_manager, target_transport,
+                                      target_instance_id, this))
     , m_token_manager(token_manager)
     , m_origin_module(origin_module)
     // Pre-build the capability_module consumer once. We skip it for
@@ -51,6 +64,18 @@ LogosAPIClient::LogosAPIClient(const QString& module_to_talk_to,
     : LogosAPIClient(module_to_talk_to, origin_module, token_manager,
                      LogosTransportConfigGlobal::getDefault(),
                      LogosTransportConfigGlobal::getDefault(), parent)
+{
+}
+
+LogosAPIClient::LogosAPIClient(const QString& module_to_talk_to,
+                               const QString& origin_module,
+                               TokenManager* token_manager,
+                               const QString& target_instance_id,
+                               QObject *parent)
+    : LogosAPIClient(module_to_talk_to, origin_module, token_manager,
+                     LogosTransportConfigGlobal::getDefault(),
+                     LogosTransportConfigGlobal::getDefault(),
+                     target_instance_id, parent)
 {
 }
 

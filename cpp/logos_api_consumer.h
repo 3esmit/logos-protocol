@@ -55,6 +55,17 @@ public:
                      const LogosTransportConfig& transport,
                      QObject *parent = nullptr);
 
+    // Explicit target-instance variant. `target_instance_id` selects the
+    // target registry endpoint only; callers still pass the logical module
+    // name to requestObject() and invokeRemoteMethod(). An empty instance ID
+    // is equivalent to the existing constructor.
+    LogosAPIConsumer(const QString& module_to_talk_to,
+                     const QString& origin_module,
+                     TokenManager* token_manager,
+                     const LogosTransportConfig& transport,
+                     const QString& target_instance_id,
+                     QObject *parent = nullptr);
+
     /**
      * @brief Convenience constructor that uses the process-global default
      * LogosTransportConfig. Equivalent to passing
@@ -65,6 +76,15 @@ public:
                               const QString& origin_module,
                               TokenManager* token_manager,
                               QObject *parent = nullptr);
+
+    // Convenience instance-aware variant using the process-global transport
+    // configuration. It preserves the name-only constructor when the supplied
+    // instance ID is empty.
+    LogosAPIConsumer(const QString& module_to_talk_to,
+                     const QString& origin_module,
+                     TokenManager* token_manager,
+                     const QString& target_instance_id,
+                     QObject *parent = nullptr);
     ~LogosAPIConsumer();
 
     /**
