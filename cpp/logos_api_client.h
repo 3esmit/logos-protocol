@@ -26,6 +26,17 @@ class LogosAPIConsumer;
 class LogosObject;
 class TokenManager;
 
+namespace logos {
+
+// Internal TokenManager identity for one explicit target instance. The
+// length-delimited form cannot alias when a module name or instance ID contains
+// a separator character. Empty instances intentionally keep the historical
+// name-only TokenManager key.
+QString scopedModuleTokenKey(const QString& moduleName,
+                             const QString& instanceId);
+
+} // namespace logos
+
 /**
  * @brief LogosAPIClient provides a high-level interface for remote method calls
  * 
@@ -392,6 +403,14 @@ public:
     bool informModuleToken(const std::string& authToken, const std::string& moduleName, const std::string& token);
     bool informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs = 20000);
 
+    // Register a bootstrap token for one explicit target instance with an
+    // instance-aware capability module. Scoped callers deliberately do not
+    // downgrade to the name-only registration path.
+    bool informModuleTokenScoped(const QString& authToken,
+                                 const QString& moduleName,
+                                 const QString& instanceId,
+                                 const QString& token);
+
     TokenManager* getTokenManager() const;
     // The OUTBOUND token for `module_name`: what this client presents when it
     // CALLS `module_name`. Never a token some caller was issued to call US —
@@ -421,6 +440,10 @@ private:
     // to: the exchange runs before the call on an un-tokened target, so a bound
     // that skipped it would describe only the second half of the operation.
     QString mintAndCacheToken(const QString& objectName, Timeout timeout);
+
+    // Empty target instances retain the historical logical-object key.
+    // Explicit instances receive independent token/cache identity.
+    QString tokenKeyFor(const QString& objectName) const;
 
     // Async invoke with a bounded retry budget backing the public
     // invokeRemoteMethodAsync overloads. On a provider rejection sentinel it
@@ -486,6 +509,11 @@ private:
     // holds. Appended last per the ABI note above.
     struct PendingReadiness { quint64 id = 0; QTimer* timer = nullptr; bool done = false; };
     QMap<QString, std::shared_ptr<PendingReadiness>> m_pendingReadiness;
+
+    // Appended after every existing private member to preserve ABI layout for
+    // statically linked consumers. It identifies the target endpoint only;
+    // business RPC object names remain logical module names.
+    QString m_target_instance_id;
 };
 
 #endif // LOGOS_API_CLIENT_H
