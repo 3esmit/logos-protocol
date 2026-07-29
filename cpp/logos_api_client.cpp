@@ -508,7 +508,10 @@ bool LogosAPIClient::informModuleTokenScoped(const QString& authToken,
         authToken,
         QStringLiteral("capability_module"),
         QStringLiteral("informModuleTokenScoped"),
-        QVariantList() << moduleName << instanceId << token,
+        // Generic dispatch only proves that the caller has some issued token.
+        // The capability provider must additionally verify that this is its
+        // trusted core/capability channel before accepting a bootstrap token.
+        QVariantList() << authToken << moduleName << instanceId << token,
         Timeout());
     return result.toBool();
 }

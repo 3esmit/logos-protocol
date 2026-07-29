@@ -293,8 +293,10 @@ public:
     bool informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token);
 
     // Register a bootstrap token for one explicit target instance with an
-    // instance-aware capability module. Scoped callers deliberately do not
-    // downgrade to the name-only registration path.
+    // instance-aware capability module. The trusted auth token is sent both
+    // in the RPC envelope and to the provider for its privileged-channel
+    // check. Scoped callers deliberately do not downgrade to the name-only
+    // registration path.
     bool informModuleTokenScoped(const QString& authToken,
                                  const QString& moduleName,
                                  const QString& instanceId,
