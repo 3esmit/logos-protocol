@@ -3,6 +3,7 @@
 #include "module_proxy.h"
 #include "token_manager.h"
 #include "logos_mode.h"
+#include "logos_rpc_status.h"
 #include "logos_instance.h"
 #include "logos_transport.h"
 #include "logos_transport_factory.h"
@@ -163,7 +164,17 @@ QVariant LogosAPIConsumer::invokeRemoteMethod(const QString& authToken, const QS
     qDebug() << "[LogosObject] LogosAPIConsumer: calling via LogosObject::callMethod" << methodName;
     // No release() here: the handle stays cached for the next call. Released in
     // clearObjectCache() (destructor / reconnect) or evicted when stale.
-    return plugin->callMethod(authToken, methodName, args, timeout.ms);
+    QVariant result = plugin->callMethod(authToken, methodName, args, timeout.ms);
+    QString providerMessage;
+    if (logos::isProviderFailureSentinel(result, &providerMessage)) {
+        if (err) {
+            err->code = "invoke_failed";
+            err->message = providerMessage.toStdString();
+            err->origin = objectName.toStdString();
+        }
+        return QVariant();
+    }
+    return result;
 }
 
 // Get-or-acquire a remote-object handle, transparently refreshing a stale one.
@@ -239,9 +250,18 @@ void LogosAPIConsumer::invokeRemoteMethodAsync(const QString& authToken, const Q
     // the handle is released by the destructor's clearObjectCache(), not here.
     QPointer<LogosAPIConsumer> self(this);
     plugin->callMethodAsync(authToken, methodName, args, timeout.ms,
-        [callback, self](QVariant result) {
+        [callback, self, objectName](QVariant result) {
             if (!self)
                 return;
+            QString providerMessage;
+            if (logos::isProviderFailureSentinel(result, &providerMessage)) {
+                logos::CallError err;
+                err.code = "invoke_failed";
+                err.message = providerMessage.toStdString();
+                err.origin = objectName.toStdString();
+                callback(QVariant(), err);
+                return;
+            }
             callback(result, logos::CallError{});
         });
 }

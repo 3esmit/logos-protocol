@@ -343,7 +343,9 @@ int lp_invoke(lp_client* client,
         if (out_error_json)
             *out_error_json = lpStrdup(makeErrorJson(
                 callErr.code.c_str(), callErr.message, callErr.origin));
-        return LP_ERR_UNAVAILABLE;
+        return callErr.code == "object_unavailable"
+            ? LP_ERR_UNAVAILABLE
+            : LP_ERR_INTERNAL;
     }
 
     if (out_result_json)
@@ -369,9 +371,15 @@ int lp_invoke_async(lp_client* client,
     std::shared_ptr<CbGuard> guard = client->guard;
     client->client->invokeRemoteMethodAsync(
         client->target, QString::fromUtf8(method), args,
-        [guard, cb, user_data](QVariant result) {
+        [guard, cb, user_data](QVariant result, const logos::CallError& callErr) {
             std::lock_guard<std::recursive_mutex> lock(guard->mutex);
             if (!guard->alive) return;  // client destroyed: drop the result
+            if (!callErr.ok()) {
+                const std::string error = makeErrorJson(
+                    callErr.code.c_str(), callErr.message, callErr.origin);
+                cb(0, error.c_str(), user_data);
+                return;
+            }
             const std::string json = logos::qvariantToNlohmann(result).dump();
             cb(1, json.c_str(), user_data);
         },
