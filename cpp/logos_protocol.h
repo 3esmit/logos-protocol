@@ -59,15 +59,15 @@
  * =========================================================================== */
 
 #define LOGOS_PROTOCOL_VERSION_MAJOR 0
-// 0.2: per-module concurrent dispatch ("multi"). Additive/back-compatible — a
-// multi module returns a deferred-completion sentinel from callMethod and pushes
-// the result as a __logos_call_complete__ event (see logos_async_dispatch.h);
-// the provider/host ABI is UNCHANGED, so same-MAJOR hosts (incl. 0.1 daemons)
-// load and forward multi modules without modification. A pre-0.2 *consumer*
-// would see the raw sentinel rather than awaiting it — graceful, not a crash.
-#define LOGOS_PROTOCOL_VERSION_MINOR 2
+// 0.2: per-module concurrent dispatch ("multi"). A multi module returns a
+// deferred-completion sentinel from callMethod and pushes the result as a
+// __logos_call_complete__ event (see logos_async_dispatch.h).
+//
+// 0.3: lp_client_create_instance() adds explicit target-instance routing to
+// the C ABI. The legacy constructor remains the default-instance route.
+#define LOGOS_PROTOCOL_VERSION_MINOR 3
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.2.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.3.0"
 
 #ifdef __cplusplus
 extern "C" {
@@ -160,6 +160,25 @@ lp_client* lp_client_create(const char* target_module,
                             const char* origin_module,
                             const char* target_transport_json,
                             const char* capability_transport_json);
+
+/**
+ * Create a client for one explicit runtime instance of `target_module`.
+ *
+ * `target_instance_id` selects the target's instance endpoint. NULL or an
+ * empty string is exactly the default-instance route used by
+ * lp_client_create(). The logical target module name and method names remain
+ * unchanged; do not encode an instance ID into `target_module`.
+ *
+ * The selected instance scopes target registry resolution, automatic
+ * capability token exchange/cache, invocation, and event subscriptions.
+ * `origin_module`, transport arguments, owner-thread behavior, and return
+ * conventions match lp_client_create().
+ */
+lp_client* lp_client_create_instance(const char* target_module,
+                                     const char* target_instance_id,
+                                     const char* origin_module,
+                                     const char* target_transport_json,
+                                     const char* capability_transport_json);
 
 /** Destroy a client. After this returns, no further callbacks fire for the
  *  client or its subscriptions. */
