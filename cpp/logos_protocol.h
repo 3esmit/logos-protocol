@@ -446,6 +446,25 @@ LP_API lp_client* lp_client_create(const char* target_module,
                             const char* target_transport_json,
                             const char* capability_transport_json);
 
+/**
+ * Create a client for one explicit runtime instance of `target_module`.
+ *
+ * `target_instance_id` selects the target's instance endpoint. NULL or an
+ * empty string is exactly the default-instance route used by
+ * lp_client_create(). The logical target module name and method names remain
+ * unchanged; do not encode an instance ID into `target_module`.
+ *
+ * The selected instance scopes target registry resolution, automatic
+ * capability token exchange/cache, invocation, and event subscriptions.
+ * `origin_module`, transport arguments, owner-thread behavior, and return
+ * conventions match lp_client_create().
+ */
+lp_client* lp_client_create_instance(const char* target_module,
+                                     const char* target_instance_id,
+                                     const char* origin_module,
+                                     const char* target_transport_json,
+                                     const char* capability_transport_json);
+
 /** Destroy a client. After this returns, no further callbacks fire for the
  *  client or its subscriptions. */
 LP_API void lp_client_destroy(lp_client* client);
