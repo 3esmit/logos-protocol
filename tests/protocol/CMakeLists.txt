@@ -6,6 +6,11 @@ add_executable(protocol_tests
     test_protocol_version.cpp
     test_json_convert_bytes.cpp
     test_universal_provider_dispatch.cpp
+    # Event payload fidelity across the universal -> Qt bridge
+    # (setEventListenerStdBridge). Every Qt-free provider emits through that one
+    # conversion; test_universal_provider_dispatch references it only to satisfy
+    # the pure virtual and asserts nothing about payloads.
+    test_event_payload_fidelity.cpp
     test_lp_client.cpp
     # The canonical LIDL <-> JSON codec (cpp/logos_codec.h): one implementation
     # of an encoding that used to exist six times with divergent semantics.
@@ -30,6 +35,11 @@ add_executable(protocol_tests
     test_rpc_framing.cpp
     test_json_codec.cpp
     test_cbor_codec.cpp
+    # uint64 across the plain wire. RpcValue had no unsigned alternative, so a
+    # value above int64max wrapped to -1 independently in each direction; no
+    # plain-tier test used an integer outside int32 range. Also pins the
+    # off-by-one in the QJsonValue::Double -> int64 guard.
+    test_plain_uint64.cpp
     # Qt-free socket-access + stale-socket reaper helpers (multi-user local
     # transport): applySocketPerms group/mode policy, isSocketDead predicate,
     # reapStaleSockets never touching live sockets or regular files.
