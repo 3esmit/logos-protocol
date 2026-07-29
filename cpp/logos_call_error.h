@@ -18,6 +18,7 @@ namespace logos {
 // Currently produced:
 //   "object_unavailable" — the target module/object could not be acquired
 //                          (not loaded, not published, or transport failure).
+//   "invoke_failed"      — the target provider threw while handling a call.
 struct CallError {
     std::string code;     // empty = no error
     std::string message;

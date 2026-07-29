@@ -107,11 +107,11 @@ public:
      * @brief invokeRemoteMethod with an explicit error out-channel.
      *
      * Fills *err with the canonical {code, message, origin} call error when
-     * the failure is detectable (today: "object_unavailable" when the target
-     * object cannot be acquired); cleared on success. Generated typed client
-     * wrappers call this overload and throw logos::LogosCallError so callers
-     * can distinguish a failed call from a legitimately default-valued
-     * result.
+     * the failure is detectable: "object_unavailable" when the target object
+     * cannot be acquired, or "invoke_failed" when the target provider throws;
+     * cleared on success. Generated typed client wrappers call this overload
+     * and throw logos::LogosCallError so callers can distinguish a failed call
+     * from a legitimately default-valued result.
      */
     QVariant invokeRemoteMethod(const QString& objectName, const QString& methodName,
                              const QVariantList& args, Timeout timeout, logos::CallError* err);
@@ -221,9 +221,10 @@ public:
      * @brief Async callback with an explicit error out-channel.
      *
      * Mirrors the sync `invokeRemoteMethod(..., CallError*)` overload. Set to
-     * code="object_unavailable" when the target object cannot be acquired,
-     * cleared on success. Callers that need to distinguish acquire failure
-     * from a legitimately empty QVariant result should use this overload.
+     * code="object_unavailable" when the target object cannot be acquired or
+     * code="invoke_failed" when the target provider throws; cleared on
+     * success. Callers that need to distinguish failures from a legitimately
+     * empty QVariant result should use this overload.
      */
     using AsyncResultErrorCallback = std::function<void(QVariant, const logos::CallError&)>;
 

@@ -121,7 +121,15 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
     // (mnemonics, passwords, tokens, key material). Log only the method name and
     // the argument count, matching the other transport call sites.
     qDebug() << "ModuleProxy: callRemoteMethod" << methodName << "args:" << args.size();
-    return m_provider->callMethod(methodName, args);
+    try {
+        return m_provider->callMethod(methodName, args);
+    } catch (...) {
+        // Provider code runs through local, QtRO, and plain transports. Never
+        // let an exception escape a queued transport callback: it bypasses the
+        // consumer completion path and can terminate the Qt event loop.
+        qWarning() << "ModuleProxy: provider invocation failed for" << methodName;
+        return logos::makeProviderFailureSentinel();
+    }
 }
 
 namespace {

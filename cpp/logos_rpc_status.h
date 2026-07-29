@@ -7,8 +7,8 @@
 #include <QString>
 #include <QMetaType>
 
-// A provider returns this reserved single-key map INSTEAD of a bare QVariant()
-// when it rejects a call for an unrecognized/stale auth token. Backward
+// A provider returns one of these reserved maps INSTEAD of a bare QVariant()
+// when it needs to communicate a transport-level call status. Backward
 // compatible by construction:
 //
 //   * OLD consumers convert it exactly like a bare QVariant() for every
@@ -21,14 +21,16 @@
 //     wrapper.
 //
 // The key is namespaced + double-underscored so it never collides with a real
-// field, and the detector requires size()==1 with the exact key AND value, so a
-// legitimate map result can't false-match. It is the ONLY provider->consumer
-// signal available on every transport (qt_local/qt_remote/plain) without an ABI
+// field, and every detector requires its exact reserved shape, so a legitimate
+// map result can't false-match. It is the ONLY provider->consumer signal
+// available on every transport (qt_local/qt_remote/plain) without an ABI
 // break, because the QtRO dispatch slot returns a single QVariant.
 namespace logos {
 
-inline constexpr char kRpcStatusKey[]          = "__logos_rpc_status__";
-inline constexpr char kRpcStatusUnauthorized[] = "unauthorized";
+inline constexpr char kRpcStatusKey[]             = "__logos_rpc_status__";
+inline constexpr char kRpcStatusMessageKey[]      = "__logos_rpc_message__";
+inline constexpr char kRpcStatusUnauthorized[]    = "unauthorized";
+inline constexpr char kRpcStatusProviderFailure[] = "provider_failure";
 
 // The provider-side rejection value. QVariantMap round-trips faithfully on all
 // three transports (qt_local pass-through; qt_remote QtRO-serialized; plain via
@@ -57,6 +59,46 @@ inline bool isUnauthorizedSentinel(const QVariant& v)
         const QJsonObject o = v.toJsonObject();
         return o.size() == 1 && o.value(key).toString() == want;
     }
+    default:
+        return false;
+    }
+}
+
+// A provider-side call threw before it could produce a method result. The
+// message is deliberately fixed: provider exception text can contain request
+// data, which must not cross a generic transport boundary.
+inline QVariant makeProviderFailureSentinel()
+{
+    QVariantMap m;
+    m.insert(QString::fromLatin1(kRpcStatusKey),
+             QString::fromLatin1(kRpcStatusProviderFailure));
+    m.insert(QString::fromLatin1(kRpcStatusMessageKey),
+             QStringLiteral("provider invocation failed"));
+    return m;
+}
+
+// True only for the exact provider-failure sentinel. `message` is optional so
+// callers that only need to classify the result do not have to copy it.
+inline bool isProviderFailureSentinel(const QVariant& v, QString* message = nullptr)
+{
+    const QString statusKey = QString::fromLatin1(kRpcStatusKey);
+    const QString messageKey = QString::fromLatin1(kRpcStatusMessageKey);
+    const QString want = QString::fromLatin1(kRpcStatusProviderFailure);
+    auto matches = [&](const auto& map) {
+        if (map.size() != 2 || map.value(statusKey).toString() != want
+            || !map.contains(messageKey)) {
+            return false;
+        }
+        if (message)
+            *message = map.value(messageKey).toString();
+        return true;
+    };
+
+    switch (v.userType()) {
+    case QMetaType::QVariantMap:
+        return matches(v.toMap());
+    case QMetaType::QJsonObject:
+        return matches(v.toJsonObject());
     default:
         return false;
     }
