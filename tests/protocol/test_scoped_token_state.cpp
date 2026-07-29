@@ -95,10 +95,10 @@ public:
             return token;
         }
 
-        if (method == QStringLiteral("informModuleTokenScoped") && args.size() == 3) {
+        if (method == QStringLiteral("informModuleTokenScoped") && args.size() == 4) {
             ++m_scopedRegistrationCount;
             m_lastRegistration = args;
-            return true;
+            return args.at(0).toString() == QStringLiteral("bootstrap-token");
         }
 
         return {};
@@ -352,9 +352,25 @@ TEST_F(ScopedTokenStateTest, ScopedBootstrapRegistrationUsesExplicitCapabilityMe
         QStringLiteral("zone_alpha"),
         QStringLiteral("target-bootstrap-token")));
     EXPECT_EQ(capabilityProvider.scopedRegistrationCount(), 1);
-    ASSERT_EQ(capabilityProvider.lastRegistration().size(), 3);
+    ASSERT_EQ(capabilityProvider.lastRegistration().size(), 4);
     EXPECT_EQ(capabilityProvider.lastRegistration().at(0).toString(),
-              QStringLiteral("lez_indexer_module"));
+              QStringLiteral("bootstrap-token"));
     EXPECT_EQ(capabilityProvider.lastRegistration().at(1).toString(),
+              QStringLiteral("lez_indexer_module"));
+    EXPECT_EQ(capabilityProvider.lastRegistration().at(2).toString(),
               QStringLiteral("zone_alpha"));
+
+    // Generic RPC accepts any issued token. The scoped provider must also see
+    // the envelope token and reject a business credential that is not its
+    // trusted bootstrap channel.
+    ASSERT_TRUE(capabilityProxy.saveToken(QStringLiteral("another_module"),
+                                          QStringLiteral("business-token")));
+    EXPECT_FALSE(capabilityClient.informModuleTokenScoped(
+        QStringLiteral("business-token"),
+        QStringLiteral("lez_indexer_module"),
+        QStringLiteral("zone_beta"),
+        QStringLiteral("target-bootstrap-token")));
+    EXPECT_EQ(capabilityProvider.scopedRegistrationCount(), 2);
+    EXPECT_EQ(capabilityProvider.lastRegistration().at(0).toString(),
+              QStringLiteral("business-token"));
 }
