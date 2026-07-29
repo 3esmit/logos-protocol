@@ -73,6 +73,33 @@ TEST_F(LpClientTest, InvokeReturnsMockedValue)
     EXPECT_TRUE(m_mock->wasCalled("test_module", "getValue"));
 }
 
+TEST_F(LpClientTest, ScopedConstructorWithEmptyInstanceUsesDefaultTarget)
+{
+    m_mock->when("test_module", "getValue").thenReturn(QVariant(42));
+
+    lp_client* nullInstance = lp_client_create_instance(
+        "test_module", nullptr, "origin", nullptr, nullptr);
+    ASSERT_NE(nullInstance, nullptr);
+    LpClientGuard nullGuard(nullInstance);
+
+    char* nullResult = nullptr;
+    ASSERT_EQ(lp_invoke(nullInstance, "getValue", "[]", 0, &nullResult, nullptr), LP_OK);
+    ASSERT_NE(nullResult, nullptr);
+    EXPECT_DOUBLE_EQ(parsed(nullResult).get<double>(), 42.0);
+    lp_string_free(nullResult);
+
+    lp_client* emptyInstance = lp_client_create_instance(
+        "test_module", "", "origin", nullptr, nullptr);
+    ASSERT_NE(emptyInstance, nullptr);
+    LpClientGuard emptyGuard(emptyInstance);
+
+    char* emptyResult = nullptr;
+    ASSERT_EQ(lp_invoke(emptyInstance, "getValue", "[]", 0, &emptyResult, nullptr), LP_OK);
+    ASSERT_NE(emptyResult, nullptr);
+    EXPECT_DOUBLE_EQ(parsed(emptyResult).get<double>(), 42.0);
+    lp_string_free(emptyResult);
+}
+
 TEST_F(LpClientTest, InvokePassesJsonArgs)
 {
     m_mock->when("mod", "echo").thenReturn(QVariant("hello back"));
@@ -216,6 +243,12 @@ TEST_F(LpClientTest, NullArgumentsAreRejected)
     EXPECT_EQ(lp_client_create(nullptr, "origin", nullptr, nullptr), nullptr);
     EXPECT_EQ(lp_client_create("", "origin", nullptr, nullptr), nullptr);
     EXPECT_EQ(lp_client_create("t", nullptr, nullptr, nullptr), nullptr);
+    EXPECT_EQ(lp_client_create_instance(nullptr, "zone_alpha", "origin", nullptr, nullptr),
+              nullptr);
+    EXPECT_EQ(lp_client_create_instance("", "zone_alpha", "origin", nullptr, nullptr),
+              nullptr);
+    EXPECT_EQ(lp_client_create_instance("t", "zone_alpha", nullptr, nullptr, nullptr),
+              nullptr);
 
     char* error = nullptr;
     EXPECT_EQ(lp_invoke(nullptr, "m", "[]", 0, nullptr, &error),

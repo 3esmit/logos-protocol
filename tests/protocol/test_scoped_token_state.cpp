@@ -3,18 +3,22 @@
 #include "logos_api_client.h"
 #include "logos_instance.h"
 #include "logos_mode.h"
+#include "logos_protocol.h"
 #include "logos_provider_interface.h"
 #include "module_proxy.h"
 #include "remote_transport.h"
 #include "token_manager.h"
 
+#include <QByteArray>
 #include <QCoreApplication>
 #include <QJsonArray>
 #include <QVariantList>
 
 #include <atomic>
 #include <chrono>
+#include <string>
 #include <thread>
+#include <utility>
 
 namespace {
 
@@ -45,16 +49,27 @@ public:
     }
 
     QJsonArray getMethods() override { return {}; }
-    void setEventListener(EventCallback) override {}
+    void setEventListener(EventCallback callback) override
+    {
+        m_eventCallback = std::move(callback);
+    }
     void init(void*) override {}
     QString providerName() const override { return QStringLiteral("lez_indexer_module"); }
     QString providerVersion() const override { return QStringLiteral("1.0.0"); }
 
     void bindProxy(ModuleProxy* proxy) { m_proxy = proxy; }
 
+    void emitNodeChanged()
+    {
+        if (m_eventCallback) {
+            m_eventCallback(QStringLiteral("nodeChanged"), QVariantList { m_label });
+        }
+    }
+
 private:
     QString m_label;
     ModuleProxy* m_proxy = nullptr;
+    EventCallback m_eventCallback;
 };
 
 class ScopedCapabilityProvider final : public LogosProviderObject {
@@ -126,6 +141,20 @@ private:
     QList<QVariantList> m_scopedRequests;
     QVariantList m_lastRegistration;
 };
+
+struct CEventCapture {
+    std::atomic<int> count { 0 };
+    std::string event;
+    std::string payload;
+};
+
+void captureCEvent(const char* event, const char* payload, void* userData)
+{
+    auto* capture = static_cast<CEventCapture*>(userData);
+    capture->event = event ? event : "";
+    capture->payload = payload ? payload : "";
+    ++capture->count;
+}
 
 } // namespace
 
@@ -233,6 +262,100 @@ TEST_F(ScopedTokenStateTest, SameModuleDifferentInstancesUseIndependentScopedTok
     EXPECT_EQ(TokenManager::instance().getToken(alphaKey), QStringLiteral("issued-zone_alpha"));
     EXPECT_EQ(TokenManager::instance().getToken(betaKey), QStringLiteral("issued-zone_beta"));
     EXPECT_TRUE(TokenManager::instance().getToken(QStringLiteral("lez_indexer_module")).isEmpty());
+}
+
+TEST_F(ScopedTokenStateTest, CAbiClientRoutesCallsAndEventsToIndependentInstances)
+{
+    const QString origin = QStringLiteral("basecamp_host");
+    const QByteArray originUtf8 = origin.toUtf8();
+    RemoteTransportHost capabilityHost(LogosInstance::id("capability_module"));
+    RemoteTransportHost alphaHost(LogosInstance::id("lez_indexer_module", "zone_alpha"));
+    RemoteTransportHost betaHost(LogosInstance::id("lez_indexer_module", "zone_beta"));
+
+    ScopedCapabilityProvider capabilityProvider;
+    ModuleProxy capabilityProxy(&capabilityProvider);
+    authorizeCapability(capabilityProxy, origin);
+
+    PingProvider alphaProvider(QStringLiteral("zone_alpha"));
+    ModuleProxy alphaProxy(&alphaProvider);
+    alphaProvider.bindProxy(&alphaProxy);
+    capabilityProvider.bindTarget(QStringLiteral("zone_alpha"), &alphaProxy);
+
+    PingProvider betaProvider(QStringLiteral("zone_beta"));
+    ModuleProxy betaProxy(&betaProvider);
+    betaProvider.bindProxy(&betaProxy);
+    capabilityProvider.bindTarget(QStringLiteral("zone_beta"), &betaProxy);
+
+    ASSERT_TRUE(capabilityHost.publishObject("capability_module", &capabilityProxy));
+    ASSERT_TRUE(alphaHost.publishObject("lez_indexer_module", &alphaProxy));
+    ASSERT_TRUE(betaHost.publishObject("lez_indexer_module", &betaProxy));
+
+    lp_client* alpha = lp_client_create_instance(
+        "lez_indexer_module", "zone_alpha", originUtf8.constData(), nullptr, nullptr);
+    ASSERT_NE(alpha, nullptr);
+    lp_client* beta = lp_client_create_instance(
+        "lez_indexer_module", "zone_beta", originUtf8.constData(), nullptr, nullptr);
+    ASSERT_NE(beta, nullptr);
+
+    char* alphaResult = nullptr;
+    ASSERT_EQ(lp_invoke(alpha, "ping", "[]", 5000, &alphaResult, nullptr), LP_OK);
+    ASSERT_NE(alphaResult, nullptr);
+    EXPECT_STREQ(alphaResult, "\"zone_alpha\"");
+    lp_string_free(alphaResult);
+
+    char* betaResult = nullptr;
+    ASSERT_EQ(lp_invoke(beta, "ping", "[]", 5000, &betaResult, nullptr), LP_OK);
+    ASSERT_NE(betaResult, nullptr);
+    EXPECT_STREQ(betaResult, "\"zone_beta\"");
+    lp_string_free(betaResult);
+
+    CEventCapture alphaEvents;
+    CEventCapture betaEvents;
+    lp_subscription* alphaSubscription = lp_subscribe(
+        alpha, "nodeChanged", &captureCEvent, &alphaEvents);
+    ASSERT_NE(alphaSubscription, nullptr);
+    lp_subscription* betaSubscription = lp_subscribe(
+        beta, "nodeChanged", &captureCEvent, &betaEvents);
+    ASSERT_NE(betaSubscription, nullptr);
+
+    for (int i = 0; i < 20; ++i) {
+        QCoreApplication::processEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    alphaProvider.emitNodeChanged();
+    for (int i = 0; i < 100 && alphaEvents.count.load() == 0; ++i) {
+        QCoreApplication::processEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(alphaEvents.count.load(), 1);
+    EXPECT_EQ(alphaEvents.event, "nodeChanged");
+    EXPECT_EQ(alphaEvents.payload, "[\"zone_alpha\"]");
+    EXPECT_EQ(betaEvents.count.load(), 0);
+
+    betaProvider.emitNodeChanged();
+    for (int i = 0; i < 100 && betaEvents.count.load() == 0; ++i) {
+        QCoreApplication::processEvents();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(alphaEvents.count.load(), 1);
+    ASSERT_EQ(betaEvents.count.load(), 1);
+    EXPECT_EQ(betaEvents.event, "nodeChanged");
+    EXPECT_EQ(betaEvents.payload, "[\"zone_beta\"]");
+
+    EXPECT_EQ(capabilityProvider.legacyRequestCount(), 0);
+    EXPECT_EQ(capabilityProvider.scopedRequestCount(), 2);
+    EXPECT_EQ(TokenManager::instance().getToken(logos::scopedModuleTokenKey(
+                  QStringLiteral("lez_indexer_module"), QStringLiteral("zone_alpha"))),
+              QStringLiteral("issued-zone_alpha"));
+    EXPECT_EQ(TokenManager::instance().getToken(logos::scopedModuleTokenKey(
+                  QStringLiteral("lez_indexer_module"), QStringLiteral("zone_beta"))),
+              QStringLiteral("issued-zone_beta"));
+
+    lp_unsubscribe(betaSubscription);
+    lp_unsubscribe(alphaSubscription);
+    lp_client_destroy(beta);
+    lp_client_destroy(alpha);
 }
 
 TEST_F(ScopedTokenStateTest, AsyncHandshakesCoalesceWithinButNotAcrossInstances)
