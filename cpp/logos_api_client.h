@@ -20,6 +20,17 @@ class LogosAPIConsumer;
 class LogosObject;
 class TokenManager;
 
+namespace logos {
+
+// Internal TokenManager identity for one explicit target instance. The
+// length-delimited form cannot alias when a module name or instance ID contains
+// a separator character. Empty instances intentionally keep the historical
+// name-only TokenManager key.
+QString scopedModuleTokenKey(const QString& moduleName,
+                             const QString& instanceId);
+
+} // namespace logos
+
 /**
  * @brief LogosAPIClient provides a high-level interface for remote method calls
  * 
@@ -281,6 +292,16 @@ public:
     bool informModuleToken(const std::string& authToken, const std::string& moduleName, const std::string& token);
     bool informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token);
 
+    // Register a bootstrap token for one explicit target instance with an
+    // instance-aware capability module. The trusted auth token is sent both
+    // in the RPC envelope and to the provider for its privileged-channel
+    // check. Scoped callers deliberately do not downgrade to the name-only
+    // registration path.
+    bool informModuleTokenScoped(const QString& authToken,
+                                 const QString& moduleName,
+                                 const QString& instanceId,
+                                 const QString& token);
+
     TokenManager* getTokenManager() const;
     QString getToken(const QString& module_name);
 
@@ -303,6 +324,10 @@ private:
     // rejection-driven re-exchange share one path. (Private method — no effect on
     // the ABI-sensitive data layout below.)
     QString mintAndCacheToken(const QString& objectName);
+
+    // Empty target instances retain the historical logical-object key.
+    // Explicit instances receive independent token/cache identity.
+    QString tokenKeyFor(const QString& objectName) const;
 
     // Async invoke with a bounded retry budget backing the public
     // invokeRemoteMethodAsync overloads. On a provider rejection sentinel it
@@ -342,8 +367,14 @@ private:
     // distinct tokens overwrite each other on the target — so already-dispatched
     // calls carry a superseded token and get rejected. Touched only on the
     // owner thread (invokeRemoteMethodAsync marshals there), so it needs no
-    // lock. Appended last per the ABI note above; defaults to empty.
+    // lock. Appended after the pre-existing ABI-sensitive layout; defaults to
+    // empty.
     QMap<QString, std::vector<std::function<void(const QString&)>>> m_pendingHandshakes;
+
+    // Appended after every existing private member to preserve ABI layout for
+    // statically linked consumers. It identifies the target endpoint only;
+    // business RPC object names remain logical module names.
+    QString m_target_instance_id;
 };
 
 #endif // LOGOS_API_CLIENT_H
