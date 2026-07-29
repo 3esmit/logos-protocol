@@ -151,7 +151,16 @@ QVariant ModuleProxy::callRemoteMethod(const QString& authToken, const QString& 
     // thread-local cannot span the two images.
     logos::CallerScope callerScope(std::move(callerJson));
 
-    const QVariant result = m_provider->callMethod(methodName, args);
+    QVariant result;
+    try {
+        result = m_provider->callMethod(methodName, args);
+    } catch (...) {
+        // Provider code runs through local, QtRO, and plain transports. Never
+        // let an exception escape a queued transport callback: it bypasses the
+        // consumer completion path and can terminate the Qt event loop.
+        qWarning() << "ModuleProxy: provider invocation failed for" << methodName;
+        return logos::makeProviderFailureSentinel();
+    }
 
     // Module identity, for a provider whose own dispatch does not answer it.
     //

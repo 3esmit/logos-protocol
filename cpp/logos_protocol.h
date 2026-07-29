@@ -328,7 +328,7 @@ extern "C" {
 #define LP_OK 0
 #define LP_ERR_INVALID_ARG (-1)
 #define LP_ERR_UNSUPPORTED (-2) /* provider surface: exercised in a later phase */
-#define LP_ERR_INTERNAL (-3)
+#define LP_ERR_INTERNAL (-3) /* provider invocation failed */
 #define LP_ERR_UNAVAILABLE (-4) /* target module/object could not be acquired */
 
 /* ---------------------------------------------------------------------------
@@ -480,7 +480,9 @@ LP_API void lp_client_destroy(lp_client* client);
  * (may be "null" — today's protocol does not distinguish "no result" from
  * a failed call at this level; that matches existing behavior).
  * On failure: *out_error_json (if non-NULL) receives the canonical error
- * object. Both out-strings are owned by the caller (lp_string_free).
+ * object. Returns LP_ERR_UNAVAILABLE when the target cannot be acquired or
+ * LP_ERR_INTERNAL when the provider invocation fails. Both out-strings are
+ * owned by the caller (lp_string_free).
  */
 LP_API int lp_invoke(lp_client* client,
               const char* method,

@@ -403,7 +403,9 @@ int lp_invoke(lp_client* client,
         if (out_error_json)
             *out_error_json = lpStrdup(makeErrorJson(
                 callErr.code.c_str(), callErr.message, callErr.origin));
-        return LP_ERR_UNAVAILABLE;
+        return callErr.code == "object_unavailable"
+            ? LP_ERR_UNAVAILABLE
+            : LP_ERR_INTERNAL;
     }
 
     if (out_result_json)

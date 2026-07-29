@@ -5,6 +5,7 @@
 #include "module_proxy.h"
 #include "token_manager.h"
 #include "logos_mode.h"
+#include "logos_rpc_status.h"
 #include "logos_instance.h"
 #include "logos_transport.h"
 #include "logos_transport_factory.h"
@@ -1091,10 +1092,23 @@ QVariant LogosAPIConsumer::invokeRemoteMethod(const QString& authToken, const QS
     // handle existed (the deadline elapsing, the connection dropping, the peer
     // answering "not published") came back as a bare QVariant() with a clean
     // err, i.e. reported as a method that returned null.
-    if (auto* channel = dynamic_cast<LogosObjectErrorChannel*>(plugin))
-        return channel->callMethodWithError(authToken, methodName, args,
-                                            timeout.ms, err);
-    return plugin->callMethod(authToken, methodName, args, timeout.ms);
+    QVariant result;
+    if (auto* channel = dynamic_cast<LogosObjectErrorChannel*>(plugin)) {
+        result = channel->callMethodWithError(authToken, methodName, args,
+                                              timeout.ms, err);
+    } else {
+        result = plugin->callMethod(authToken, methodName, args, timeout.ms);
+    }
+    QString providerMessage;
+    if (logos::isProviderFailureSentinel(result, &providerMessage)) {
+        if (err) {
+            err->code = "invoke_failed";
+            err->message = providerMessage.toStdString();
+            err->origin = objectName.toStdString();
+        }
+        return QVariant();
+    }
+    return result;
 }
 
 // Get-or-acquire a remote-object handle, transparently refreshing a stale one.
@@ -1200,9 +1214,18 @@ void LogosAPIConsumer::invokeRemoteMethodAsync(const QString& authToken, const Q
     // Transport without an error channel (the mock): unchanged behaviour —
     // the value, and no diagnosis to give.
     plugin->callMethodAsync(authToken, methodName, args, timeout.ms,
-        [callback, self](QVariant result) {
+        [callback, self, objectName](QVariant result) {
             if (!self)
                 return;
+            QString providerMessage;
+            if (logos::isProviderFailureSentinel(result, &providerMessage)) {
+                logos::CallError err;
+                err.code = "invoke_failed";
+                err.message = providerMessage.toStdString();
+                err.origin = objectName.toStdString();
+                callback(QVariant(), err);
+                return;
+            }
             callback(result, logos::CallError{});
         });
 }

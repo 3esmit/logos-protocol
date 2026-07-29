@@ -32,6 +32,7 @@ namespace logos {
 //                          result value — see logos-cpp-sdk#129).
 //   "unauthorized"       — the provider rejected our token and the one
 //                          permitted re-exchange also failed.
+//   "invoke_failed"      — the target provider threw while handling a call.
 struct CallError {
     std::string code;     // empty = no error
     std::string message;

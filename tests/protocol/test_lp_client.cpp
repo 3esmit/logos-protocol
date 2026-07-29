@@ -2,13 +2,21 @@
 
 #include "logos_protocol.h"
 #include "logos_mock.h"
+#include "logos_mode.h"
+#include "logos_provider_interface.h"
+#include "module_proxy.h"
+#include "plugin_registry.h"
+#include "token_manager.h"
 
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QElapsedTimer>
+#include <QEventLoop>
+#include <QJsonArray>
 #include <QVariant>
 
 #include <atomic>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -29,6 +37,86 @@ struct LpClientGuard {
 nlohmann::json parsed(const char* json)
 {
     return nlohmann::json::parse(json, nullptr, /*allow_exceptions=*/false);
+}
+
+class LocalModeScope {
+public:
+    LocalModeScope()
+        : previousMode_(LogosModeConfig::getMode())
+    {
+        LogosModeConfig::setMode(LogosMode::Local);
+        TokenManager::instance().clearAllTokens();
+    }
+
+    ~LocalModeScope()
+    {
+        TokenManager::instance().clearAllTokens();
+        LogosModeConfig::setMode(previousMode_);
+    }
+
+private:
+    LogosMode previousMode_;
+};
+
+class ThrowingProvider final : public LogosProviderObject {
+public:
+    QVariant callMethod(const QString& method, const QVariantList&) override
+    {
+        if (method == QLatin1String("throws"))
+            throw std::runtime_error("test provider failure");
+        if (method == QLatin1String("stillWorks"))
+            return QStringLiteral("still running");
+        return QVariant();
+    }
+
+    bool informModuleToken(const QString&, const QString&) override { return true; }
+    QJsonArray getMethods() override { return QJsonArray(); }
+    void setEventListener(EventCallback) override {}
+    void init(void*) override {}
+    QString providerName() const override { return QStringLiteral("throwing_module"); }
+    QString providerVersion() const override { return QStringLiteral("1.0.0"); }
+};
+
+class LocalPluginRegistration {
+public:
+    LocalPluginRegistration(const QString& name, QObject* object)
+        : name_(name)
+    {
+        PluginRegistry::registerPlugin(object, name_);
+    }
+
+    ~LocalPluginRegistration()
+    {
+        PluginRegistry::unregisterPlugin(name_);
+    }
+
+private:
+    QString name_;
+};
+
+struct AsyncCapture {
+    bool done = false;
+    int callbackCount = 0;
+    int ok = -1;
+    std::string json;
+};
+
+void captureAsyncResult(int ok, const char* json, void* userData)
+{
+    auto* capture = static_cast<AsyncCapture*>(userData);
+    ++capture->callbackCount;
+    capture->ok = ok;
+    capture->json = json ? json : "";
+    capture->done = true;
+}
+
+bool waitForAsyncResult(const AsyncCapture& capture)
+{
+    QElapsedTimer timer;
+    timer.start();
+    while (!capture.done && timer.elapsed() < 5000)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    return capture.done;
 }
 
 } // namespace
@@ -180,6 +268,56 @@ TEST_F(LpClientTest, InvokeAsyncDeliversResult)
     ASSERT_TRUE(capture.done) << "async result not delivered within 5s";
     EXPECT_EQ(capture.ok, 1);
     EXPECT_DOUBLE_EQ(parsed(capture.json.c_str()).get<double>(), 7.0);
+}
+
+TEST(LpClientAsync, ProviderExceptionReturnsCanonicalErrorAndKeepsEventLoopUsable)
+{
+    LocalModeScope mode;
+    ThrowingProvider provider;
+    ModuleProxy proxy(&provider);
+    proxy.setTokenValidator([](const QString& token, const QString&) {
+        return token == QLatin1String("test-token");
+    });
+    LocalPluginRegistration registration(QStringLiteral("throwing_module"), &proxy);
+
+    ASSERT_EQ(lp_token_save("throwing_module", "test-token"), LP_OK);
+    lp_client* client = lp_client_create("throwing_module", "test-origin", nullptr, nullptr);
+    ASSERT_NE(client, nullptr);
+    LpClientGuard guard(client);
+
+    AsyncCapture asyncFailure;
+    ASSERT_EQ(lp_invoke_async(client, "throws", "[]", 0,
+                              &captureAsyncResult, &asyncFailure), LP_OK);
+    ASSERT_TRUE(waitForAsyncResult(asyncFailure))
+        << "provider failure was not delivered within 5s";
+    EXPECT_EQ(asyncFailure.callbackCount, 1);
+    EXPECT_EQ(asyncFailure.ok, 0);
+    const nlohmann::json asyncError = parsed(asyncFailure.json.c_str());
+    ASSERT_TRUE(asyncError.is_object());
+    EXPECT_EQ(asyncError.value("code", std::string{}), "invoke_failed");
+    EXPECT_EQ(asyncError.value("origin", std::string{}), "throwing_module");
+    EXPECT_EQ(asyncError.value("message", std::string{}), "provider invocation failed");
+
+    char* syncError = nullptr;
+    EXPECT_EQ(lp_invoke(client, "throws", "[]", 0, nullptr, &syncError), LP_ERR_INTERNAL);
+    ASSERT_NE(syncError, nullptr);
+    const nlohmann::json parsedSyncError = parsed(syncError);
+    EXPECT_EQ(parsedSyncError.value("code", std::string{}), "invoke_failed");
+    EXPECT_EQ(parsedSyncError.value("origin", std::string{}), "throwing_module");
+    lp_string_free(syncError);
+
+    AsyncCapture success;
+    ASSERT_EQ(lp_invoke_async(client, "stillWorks", "[]", 0,
+                              &captureAsyncResult, &success), LP_OK);
+    ASSERT_TRUE(waitForAsyncResult(success))
+        << "event loop did not process a later provider result";
+    EXPECT_EQ(success.callbackCount, 1);
+    EXPECT_EQ(success.ok, 1);
+    EXPECT_EQ(parsed(success.json.c_str()).get<std::string>(), "still running");
+
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    EXPECT_EQ(asyncFailure.callbackCount, 1);
+    EXPECT_EQ(success.callbackCount, 1);
 }
 
 TEST_F(LpClientTest, DestroyFromWorkerThreadIsSafe)
