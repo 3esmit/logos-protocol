@@ -1,5 +1,7 @@
 #include "json_mapping.h"
 
+#include "../../logos_codec.h"
+
 #include <type_traits>
 
 namespace logos::plain {
@@ -26,73 +28,6 @@ using json = nlohmann::json;
 
 namespace {
 
-std::string b64url_encode(const std::vector<uint8_t>& bytes)
-{
-    static const char* alpha =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    std::string out;
-    out.reserve(((bytes.size() + 2) / 3) * 4);
-    size_t i = 0;
-    while (i + 3 <= bytes.size()) {
-        uint32_t n = (uint32_t(bytes[i]) << 16) | (uint32_t(bytes[i+1]) << 8) | uint32_t(bytes[i+2]);
-        out.push_back(alpha[(n >> 18) & 0x3f]);
-        out.push_back(alpha[(n >> 12) & 0x3f]);
-        out.push_back(alpha[(n >>  6) & 0x3f]);
-        out.push_back(alpha[ n        & 0x3f]);
-        i += 3;
-    }
-    if (i < bytes.size()) {
-        uint32_t n = uint32_t(bytes[i]) << 16;
-        if (i + 1 < bytes.size()) n |= uint32_t(bytes[i+1]) << 8;
-        out.push_back(alpha[(n >> 18) & 0x3f]);
-        out.push_back(alpha[(n >> 12) & 0x3f]);
-        if (i + 1 < bytes.size())
-            out.push_back(alpha[(n >>  6) & 0x3f]);
-    }
-    return out;
-}
-
-std::vector<uint8_t> b64url_decode(const std::string& s)
-{
-    auto idx = [](char c) -> int {
-        if (c >= 'A' && c <= 'Z') return c - 'A';
-        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-        if (c >= '0' && c <= '9') return c - '0' + 52;
-        if (c == '-') return 62;
-        if (c == '_') return 63;
-        return -1;
-    };
-    std::vector<uint8_t> out;
-    out.reserve((s.size() * 3) / 4);
-    size_t i = 0;
-    while (i + 4 <= s.size()) {
-        int a = idx(s[i]), b = idx(s[i+1]), c = idx(s[i+2]), d = idx(s[i+3]);
-        if (a < 0 || b < 0 || c < 0 || d < 0)
-            throw CodecError("invalid base64url input");
-        uint32_t n = (uint32_t(a) << 18) | (uint32_t(b) << 12) | (uint32_t(c) << 6) | uint32_t(d);
-        out.push_back((n >> 16) & 0xff);
-        out.push_back((n >>  8) & 0xff);
-        out.push_back( n        & 0xff);
-        i += 4;
-    }
-    size_t rem = s.size() - i;
-    if (rem == 2 || rem == 3) {
-        int a = idx(s[i]), b = idx(s[i+1]);
-        if (a < 0 || b < 0) throw CodecError("invalid base64url input");
-        uint32_t n = (uint32_t(a) << 18) | (uint32_t(b) << 12);
-        out.push_back((n >> 16) & 0xff);
-        if (rem == 3) {
-            int c = idx(s[i+2]);
-            if (c < 0) throw CodecError("invalid base64url input");
-            n |= uint32_t(c) << 6;
-            out.push_back((n >>  8) & 0xff);
-        }
-    } else if (rem != 0) {
-        throw CodecError("invalid base64url length");
-    }
-    return out;
-}
-
 json valueToJson(const RpcValue& v);
 RpcValue jsonToValue(const json& j);
 
@@ -101,9 +36,10 @@ json valueToJson(const RpcValue& v)
     if (v.isNull())   return nullptr;
     if (v.isBool())   return v.asBool();
     if (v.isInt())    return v.asInt();
+    if (v.isUInt())   return v.asUInt();   // > int64max: nlohmann keeps it as number_unsigned
     if (v.isDouble()) return v.asDouble();
     if (v.isString()) return v.asString();
-    if (v.isBytes())  return json{{"_bytes", b64url_encode(v.asBytes().data)}};
+    if (v.isBytes())  return logos::bytesToJson(v.asBytes().data);
     if (v.isList()) {
         json arr = json::array();
         for (const auto& item : v.asList().items) arr.push_back(valueToJson(item));
@@ -121,7 +57,12 @@ RpcValue jsonToValue(const json& j)
 {
     if (j.is_null())    return RpcValue{std::monostate{}};
     if (j.is_boolean()) return RpcValue{j.get<bool>()};
-    if (j.is_number_integer() || j.is_number_unsigned())
+    // is_number_unsigned() is checked FIRST and routed through makeInteger:
+    // .get<int64_t>() on a value above int64max wraps silently (2^64-1 -> -1)
+    // with no exception, so a correct peer's uint64 used to arrive as -1.
+    if (j.is_number_unsigned())
+        return RpcValue::makeInteger(j.get<uint64_t>());
+    if (j.is_number_integer())
         return RpcValue{j.get<int64_t>()};
     if (j.is_number_float()) return RpcValue{j.get<double>()};
     if (j.is_string())       return RpcValue{j.get<std::string>()};
@@ -133,8 +74,11 @@ RpcValue jsonToValue(const json& j)
     }
     if (j.is_object()) {
         // Disambiguate bytes.
-        if (j.size() == 1 && j.contains("_bytes") && j["_bytes"].is_string()) {
-            return RpcValue{RpcBytes{b64url_decode(j["_bytes"].get<std::string>())}};
+        if (logos::isTaggedBytes(j)) {
+            std::vector<uint8_t> bytes;
+            if (!logos::b64UrlDecodeChecked(j["_bytes"].get<std::string>(), bytes))
+                throw CodecError("invalid base64url input");
+            return RpcValue{RpcBytes{std::move(bytes)}};
         }
         RpcMap map;
         for (auto it = j.begin(); it != j.end(); ++it)
