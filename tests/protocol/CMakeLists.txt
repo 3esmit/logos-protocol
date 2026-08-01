@@ -5,8 +5,23 @@ add_executable(protocol_tests
     # New protocol-level tests
     test_protocol_version.cpp
     test_json_convert_bytes.cpp
+    # The `result` half of the canonical converter pair: qvariantToNlohmann has
+    # always owned LogosResult -> JSON; jsonToLogosResult is its inverse, and
+    # the state it exists to protect is an ABSENT error (which no
+    # std::string-typed intermediate can carry).
+    test_json_convert_result.cpp
     test_universal_provider_dispatch.cpp
+    # Event payload fidelity across the universal -> Qt bridge
+    # (setEventListenerStdBridge). Every Qt-free provider emits through that one
+    # conversion; test_universal_provider_dispatch references it only to satisfy
+    # the pure virtual and asserts nothing about payloads.
+    test_event_payload_fidelity.cpp
     test_lp_client.cpp
+    # The canonical LIDL <-> JSON codec (cpp/logos_codec.h): one implementation
+    # of an encoding that used to exist six times with divergent semantics.
+    # Pins the contract — accepted shapes, rejected shapes, and bytes staying
+    # tagged at any nesting depth.
+    test_codec.cpp
     # Owner-thread anchoring for lp clients: a client created from a worker
     # thread (the generated bind_<iface>() wrapper is lazy, so the first caller
     # wins) must still be serviced by the Qt main thread's event loop instead of
@@ -27,12 +42,31 @@ add_executable(protocol_tests
     test_rpc_framing.cpp
     test_json_codec.cpp
     test_cbor_codec.cpp
+    # uint64 across the plain wire. RpcValue had no unsigned alternative, so a
+    # value above int64max wrapped to -1 independently in each direction; no
+    # plain-tier test used an integer outside int32 range. Also pins the
+    # off-by-one in the QJsonValue::Double -> int64 guard.
+    test_plain_uint64.cpp
     # Qt-free socket-access + stale-socket reaper helpers (multi-user local
     # transport): applySocketPerms group/mode policy, isSocketDead predicate,
     # reapStaleSockets never touching live sockets or regular files.
     test_socket_paths.cpp
     # Per-module concurrent dispatch (concurrency:"multi") over the plain transport.
     test_concurrent_dispatch.cpp
+    # The in-band pending-call sentinel's shape check. Detection used to be a
+    # bare contains(), so any user map carrying the key hung the call for the
+    # full timeout. Includes what the guard does NOT close.
+    test_pending_sentinel.cpp
+    # Teardown race: fail() must close the socket on the connection's strand,
+    # not on the caller's thread — a caller-thread close ran concurrently with
+    # the io thread initiating async_write and segfaulted inside asio's
+    # reactor. Also guards the fix against leaking descriptors or hanging.
+    test_rpc_connection_teardown.cpp
+    # The acceptor half of the same race: RpcServer::stop() closed m_acceptor on
+    # the caller's thread while doAccept() re-armed async_accept on the io
+    # thread. Also guards that arming the first accept on the strand (rather
+    # than inline in start()) still serves a client that connects immediately.
+    test_rpc_server_teardown.cpp
     # Event delivery + reentrant-release teardown over the qt_remote (LocalSocket)
     # transport — the path a deferred "multi" completion event takes, and where the
     # refresh_balances onClientRead re-entrancy crash lived.
