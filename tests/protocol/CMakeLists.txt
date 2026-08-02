@@ -78,9 +78,6 @@ add_executable(protocol_tests
     # rejected as unauthorized. Post-fix exactly one handshake fires per
     # (client, target) pair.
     test_token_cache.cpp
-    # Worker-thread token delivery must marshal Qt transport work back to the
-    # LogosAPIClient owner thread.
-    test_token_delivery_owner_thread.cpp
     # Rejection-driven token re-exchange: when a provider rejects a call for a
     # stale/unrecognized token it returns the structured sentinel
     # (logos_rpc_status.h); the client drops the cached token, re-runs
@@ -106,3 +103,25 @@ target_link_libraries(protocol_tests PRIVATE
 )
 
 gtest_discover_tests(protocol_tests)
+
+# Keep owner-thread token delivery in its own test process so CTest can bound a
+# blocked cross-thread regression without imposing that deadline on the full
+# protocol suite.
+add_executable(token_delivery_owner_thread_tests
+    test_main.cpp
+    test_token_delivery_owner_thread.cpp
+)
+
+target_include_directories(token_delivery_owner_thread_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(token_delivery_owner_thread_tests PRIVATE
+    logos_protocol
+    GTest::gtest
+    Qt${QT_VERSION_MAJOR}::Core
+    Qt${QT_VERSION_MAJOR}::RemoteObjects
+    Qt${QT_VERSION_MAJOR}::Test
+)
+
+gtest_discover_tests(token_delivery_owner_thread_tests PROPERTIES TIMEOUT 10)

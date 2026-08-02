@@ -66,8 +66,12 @@ private:
 
 class ThreadCapturingProvider final : public LogosProviderObject {
 public:
-    QVariant callMethod(const QString&, const QVariantList&) override
+    QVariant callMethod(const QString& method, const QVariantList&) override
     {
+        if (method == QLatin1String("informModuleTokenScoped")) {
+            m_deliveryThread = QThread::currentThread();
+            return true;
+        }
         return QVariant();
     }
 
@@ -163,6 +167,26 @@ TEST_F(TokenDeliveryOwnerThreadTest, InformModuleTokenModuleRunsOnClientOwnerThr
                                                QStringLiteral("origin_module"),
                                                QStringLiteral("accounts_module"),
                                                QStringLiteral("issued-token"));
+    }));
+    EXPECT_EQ(provider.deliveryThread(), clientThread);
+}
+
+TEST_F(TokenDeliveryOwnerThreadTest, InformModuleTokenScopedRunsOnClientOwnerThread)
+{
+    ThreadCapturingProvider provider;
+    ModuleProxy proxy(&provider);
+    LocalPluginRegistration registration(QStringLiteral("capability_module"), &proxy);
+    TokenManager::instance().saveToken(QStringLiteral("core"), QStringLiteral("trusted-token"));
+
+    LogosAPIClient client(QStringLiteral("core"), QStringLiteral("core"),
+                          &TokenManager::instance());
+    QThread* const clientThread = client.thread();
+
+    EXPECT_TRUE(callFromWorkerAndPump([&client]() {
+        return client.informModuleTokenScoped(QStringLiteral("trusted-token"),
+                                              QStringLiteral("accounts_module"),
+                                              QStringLiteral("zone-alpha"),
+                                              QStringLiteral("issued-token"));
     }));
     EXPECT_EQ(provider.deliveryThread(), clientThread);
 }
