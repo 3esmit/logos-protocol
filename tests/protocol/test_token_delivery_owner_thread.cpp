@@ -16,7 +16,6 @@
 #include "token_manager.h"
 
 #include <QCoreApplication>
-#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QJsonArray>
 #include <QThread>
@@ -103,15 +102,16 @@ bool callFromWorkerAndPump(Fn&& fn)
         complete.store(true, std::memory_order_release);
     });
 
-    QElapsedTimer timer;
-    timer.start();
-    while (!complete.load(std::memory_order_acquire) && timer.elapsed() < 5000) {
+    // Keep the owner event loop available until the worker's blocking queued
+    // delivery completes. The dedicated CTest timeout bounds a genuine
+    // regression; stopping the pump early would deadlock worker.join().
+    while (!complete.load(std::memory_order_acquire)) {
         QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
     worker.join();
-    return complete.load(std::memory_order_acquire) && result;
+    return result;
 }
 
 } // namespace
