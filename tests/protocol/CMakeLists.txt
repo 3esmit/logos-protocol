@@ -366,6 +366,7 @@ add_executable(protocol_tests
     # yet, and nothing re-probes an entry — so caching that reason writes a merely-late
     # module off for the life of the process.
     test_handshake_negative_cache.cpp
+    test_token_delivery_owner_thread.cpp
     # Rejection-driven token re-exchange: when a provider rejects a call for a
     # stale/unrecognized token it returns the structured sentinel
     # (logos_rpc_status.h); the client drops the cached token, re-runs
