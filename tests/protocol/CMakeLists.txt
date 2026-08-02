@@ -78,6 +78,9 @@ add_executable(protocol_tests
     # rejected as unauthorized. Post-fix exactly one handshake fires per
     # (client, target) pair.
     test_token_cache.cpp
+    # Worker-thread token delivery must marshal Qt transport work back to the
+    # LogosAPIClient owner thread.
+    test_token_delivery_owner_thread.cpp
     # Rejection-driven token re-exchange: when a provider rejects a call for a
     # stale/unrecognized token it returns the structured sentinel
     # (logos_rpc_status.h); the client drops the cached token, re-runs
