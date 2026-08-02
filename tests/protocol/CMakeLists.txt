@@ -354,6 +354,7 @@ add_executable(protocol_tests
     # rejected as unauthorized. Post-fix exactly one handshake fires per
     # (client, target) pair.
     test_token_cache.cpp
+<<<<<<< HEAD
     # Readiness-gated exchange: the token exchange used to ask "is the target there?"
     # on capability_module's own budget while the call about to follow asked the same
     # question on the caller's, much longer, one — so a module that had not finished
@@ -367,6 +368,8 @@ add_executable(protocol_tests
     # module off for the life of the process.
     test_handshake_negative_cache.cpp
     test_token_delivery_owner_thread.cpp
+=======
+>>>>>>> 3ed2836 (fix(protocol): marshal scoped token delivery)
     # Rejection-driven token re-exchange: when a provider rejects a call for a
     # stale/unrecognized token it returns the structured sentinel
     # (logos_rpc_status.h); the client drops the cached token, re-runs
@@ -507,3 +510,25 @@ target_link_libraries(protocol_noqt_tests PRIVATE
 )
 
 gtest_discover_tests(protocol_noqt_tests)
+
+# Keep owner-thread token delivery in its own test process so CTest can bound a
+# blocked cross-thread regression without imposing that deadline on the full
+# protocol suite.
+add_executable(token_delivery_owner_thread_tests
+    test_main.cpp
+    test_token_delivery_owner_thread.cpp
+)
+
+target_include_directories(token_delivery_owner_thread_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(token_delivery_owner_thread_tests PRIVATE
+    logos_protocol
+    GTest::gtest
+    Qt${QT_VERSION_MAJOR}::Core
+    Qt${QT_VERSION_MAJOR}::RemoteObjects
+    Qt${QT_VERSION_MAJOR}::Test
+)
+
+gtest_discover_tests(token_delivery_owner_thread_tests PROPERTIES TIMEOUT 10)
