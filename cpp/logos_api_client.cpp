@@ -481,7 +481,11 @@ void LogosAPIClient::onEventResponse(QObject* object, const QString& eventName, 
 
 bool LogosAPIClient::informModuleToken(const QString& authToken, const QString& moduleName, const QString& token)
 {
-    return m_consumer->informModuleToken(authToken, moduleName, token);
+    // Token delivery acquires a transport replica, so it must use the same
+    // owner-thread boundary as other synchronous consumer operations.
+    return logos::runOnOwnerThread(this, [&]() {
+        return m_consumer->informModuleToken(authToken, moduleName, token);
+    });
 }
 
 bool LogosAPIClient::informModuleToken(const std::string& authToken, const std::string& moduleName, const std::string& token)
@@ -493,7 +497,11 @@ bool LogosAPIClient::informModuleToken(const std::string& authToken, const std::
 
 bool LogosAPIClient::informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token)
 {
-    return m_consumer->informModuleToken_module(authToken, originModule, moduleName, token);
+    // The origin-module variant also acquires a transport replica.
+    return logos::runOnOwnerThread(this, [&]() {
+        return m_consumer->informModuleToken_module(authToken, originModule,
+                                                     moduleName, token);
+    });
 }
 
 bool LogosAPIClient::informModuleTokenScoped(const QString& authToken,
@@ -504,16 +512,20 @@ bool LogosAPIClient::informModuleTokenScoped(const QString& authToken,
     if (instanceId.isEmpty())
         return informModuleToken(authToken, moduleName, token);
 
-    const QVariant result = m_consumer->invokeRemoteMethod(
-        authToken,
-        QStringLiteral("capability_module"),
-        QStringLiteral("informModuleTokenScoped"),
-        // Generic dispatch only proves that the caller has some issued token.
-        // The capability provider must additionally verify that this is its
-        // trusted core/capability channel before accepting a bootstrap token.
-        QVariantList() << authToken << moduleName << instanceId << token,
-        Timeout());
-    return result.toBool();
+    // Scoped token delivery uses a generic RPC rather than the legacy
+    // informModuleToken slot, but it still acquires a transport replica.
+    return logos::runOnOwnerThread(this, [&]() {
+        const QVariant result = m_consumer->invokeRemoteMethod(
+            authToken,
+            QStringLiteral("capability_module"),
+            QStringLiteral("informModuleTokenScoped"),
+            // Generic dispatch only proves that the caller has some issued token.
+            // The capability provider must additionally verify that this is its
+            // trusted core/capability channel before accepting a bootstrap token.
+            QVariantList() << authToken << moduleName << instanceId << token,
+            Timeout());
+        return result.toBool();
+    });
 }
 
 TokenManager* LogosAPIClient::getTokenManager() const
