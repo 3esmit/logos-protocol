@@ -6,6 +6,7 @@
 #include <QVariant>
 #include <QVariantList>
 #include <QHash>
+#include <QSet>
 #include <QMap>
 #include <functional>
 #include <memory>
@@ -144,10 +145,22 @@ public:
 
 public slots:
     bool informModuleToken(const QString& authToken, const QString& moduleName, const QString& token);
-    bool informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token);
+    // Delivers a token to `originModule`, preferring its handshake surface (see
+    // logos::handshakeObjectName) so a target that is still running its
+    // initializer is still reachable; falls back to the business object for
+    // modules built before that surface existed. timeoutMs bounds the fallback
+    // acquire and the call; the default preserves the historical 20s.
+    bool informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs = 20000);
     std::string requestModule(const std::string& authToken, const std::string& originModule, const std::string& targetModule);
 
 private:
+    // Deliver via the target's business object (the pre-handshake path). Used
+    // when the target publishes no handshake surface, and when its handshake
+    // surface refused the push because the target is still initializing.
+    // Deliberately NOT a slot: it is an internal step of informModuleToken_module,
+    // not a separate remote entry point.
+    bool informModuleTokenViaBusinessObject(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs);
+
     // Get a cached remote-object handle for objectName, (re)acquiring via the
     // transport if absent or stale. Acquiring a QtRO replica (acquireDynamic +
     // waitForSource) is expensive, so invokeRemoteMethod reuses one handle per
@@ -163,6 +176,11 @@ private:
     // Object-handle cache keyed by object name. Single-threaded: touched only on
     // the consumer's event-loop thread.
     QHash<QString, LogosObject*> m_objectCache;
+    // Handshake object names known to be absent. acquireCachedObject caches only
+    // successes, so without this a module built before the handshake surface
+    // existed would pay the full probe budget on every single grant. Cleared by
+    // clearObjectCache() so a reconnect or a reloaded module is re-probed.
+    QSet<QString> m_noHandshakeSurface;
 };
 
 #endif // LOGOS_API_CONSUMER_H
