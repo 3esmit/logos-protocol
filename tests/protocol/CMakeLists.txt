@@ -28,6 +28,55 @@ add_executable(protocol_tests
     # falling out on replica-acquire timeouts.
     test_lp_client_owner_thread.cpp
     test_call_error.cpp
+    # The ASYNC half of the same channel. lp_invoke_async subscribed with the
+    # value-only transport overload and hard-coded cb(1, ...), so a failed call
+    # reached lp_result_cb as a success carrying a default value — the exact
+    # thing lp_result_cb's own doc comment (and its sync twin lp_invoke) says
+    # cannot happen. Matched pair: a failing call must report ok=0 with the
+    # canonical error object, a succeeding one must still report ok=1 with its
+    # value. Both over a real (plain TCP) transport.
+    test_lp_invoke_async_error.cpp
+    # The rest of that channel: everything the TRANSPORT learns once acquire has
+    # already succeeded — a timeout, and MODULE_NOT_LOADED against a host that is
+    # up (which is not an acquire failure on the plain transport, because
+    # requestObject never checks publication). Both were discarded by
+    # PlainLogosObject and by the hard-coded empty CallError above it, on the
+    # SYNC path as much as the async one. Matched set: the two failures must
+    # report the canonical error object, the successes must still report their
+    # value, and the one case that genuinely cannot be fixed here (an unknown
+    # method, which every provider answers with a bare null) is pinned as-is.
+    test_call_error_after_acquire.cpp
+    # The same channel over the DEFAULT transport (LocalSocket/QtRO), so the fix
+    # is not silently plain-TCP-only. Exercises the deferred-completion timeout,
+    # which needs no blocking provider and therefore no second event loop.
+    test_call_error_qt_remote.cpp
+    # Teardown of a PlainLogosObject with a call still IN FLIGHT. Joining the
+    # per-call waiters closed a use-after-free but left release() blocking for
+    # the remainder of the call's timeout (up to the 20s default), because
+    # joinWaiters() could only join, never ask a waiter to stop. Pins all three
+    # halves of the fix: teardown costs one wait slice, the callback still fires
+    # EXACTLY ONCE on every outcome including cancellation (a waiter that just
+    # returns turns a stall into a hang), and the join that keeps `this` alive
+    # under the waiter is still there.
+    test_plain_object_teardown.cpp
+    # The other half of the same mechanism: what a COMPLETED call leaves behind.
+    # A waiter cannot join itself, so while the registry was a plain vector the
+    # only thing that ever emptied it was teardown, and every finished call
+    # parked an unjoined thread (~one page of resident memory) for the life of
+    # the handle — unbounded under the cached-handle shape LogosAPIConsumer
+    # actually uses. Pins the registry not growing with call count, the
+    # reap-vs-publish race not deadlocking, and teardown still joining what is
+    # left.
+    test_plain_waiter_reaping.cpp
+    # The ordering rule the other two rest on: publishFinishedWaiter() is a
+    # waiter's LAST access to the object, which is the only reason
+    # stopAndJoinWaiters() can return while a reaper is still mid-join on a
+    # waiter it has already taken out of m_waiters. No supported caller can
+    # provoke the use-after-free an extra access below the publish would create,
+    # so this observes the accesses directly: the object is placed across a page
+    # boundary at m_waiterMu and its non-registry page is guarded while a waiter
+    # runs.
+    test_plain_waiter_publish_is_last.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp
@@ -53,6 +102,9 @@ add_executable(protocol_tests
     test_socket_paths.cpp
     # Per-module concurrent dispatch (concurrency:"multi") over the plain transport.
     test_concurrent_dispatch.cpp
+    # The token-only handshake surface published before a module's initializer.
+    test_handshake_surface.cpp
+    test_handshake_surface_transport.cpp
     # The in-band pending-call sentinel's shape check. Detection used to be a
     # bare contains(), so any user map carrying the key hung the call for the
     # full timeout. Includes what the guard does NOT close.
