@@ -1,6 +1,7 @@
 #include "logos_protocol.h"
 
 #include "logos_api_client.h"
+#include "logos_call_error.h"
 #include "logos_json_convert.h"
 #include "logos_mode.h"
 #include "logos_object.h"
@@ -344,6 +345,8 @@ int lp_invoke(lp_client* client,
             *out_error_json = lpStrdup(makeErrorJson(
                 callErr.code.c_str(), callErr.message, callErr.origin));
         return callErr.code == "object_unavailable"
+                   || callErr.code == "timeout"
+                   || callErr.code == "transport_error"
             ? LP_ERR_UNAVAILABLE
             : LP_ERR_INTERNAL;
     }
@@ -369,15 +372,28 @@ int lp_invoke_async(lp_client* client,
         return LP_ERR_INVALID_ARG;
 
     std::shared_ptr<CbGuard> guard = client->guard;
+    // A TWO-argument lambda: invocable only as LogosAPIClient's
+    // AsyncResultErrorCallback, so it binds to the CallError-aware overload and
+    // never to the value-only one sitting next to it. That overload is what
+    // makes `ok == 0` reachable at all — this used to subscribe with the
+    // value-only one and hard-code cb(1, ...), so a call to a module that is
+    // not loaded reached the callback as a SUCCESS carrying a default value,
+    // contradicting both lp_result_cb's documented contract and the sync twin
+    // lp_invoke (which returns LP_ERR_UNAVAILABLE + out_error_json).
+    //
+    // The failure shape is deliberately identical to lp_invoke's
+    // out_error_json — the same makeErrorJson({code, message, origin}) — so the
+    // two entry points report the same event the same way, and a caller can
+    // parse one decoder for both.
     client->client->invokeRemoteMethodAsync(
         client->target, QString::fromUtf8(method), args,
-        [guard, cb, user_data](QVariant result, const logos::CallError& callErr) {
+        [guard, cb, user_data](QVariant result, const logos::CallError& err) {
             std::lock_guard<std::recursive_mutex> lock(guard->mutex);
             if (!guard->alive) return;  // client destroyed: drop the result
-            if (!callErr.ok()) {
-                const std::string error = makeErrorJson(
-                    callErr.code.c_str(), callErr.message, callErr.origin);
-                cb(0, error.c_str(), user_data);
+            if (!err.ok()) {
+                const std::string json = makeErrorJson(err.code.c_str(),
+                                                       err.message, err.origin);
+                cb(0, json.c_str(), user_data);
                 return;
             }
             const std::string json = logos::qvariantToNlohmann(result).dump();

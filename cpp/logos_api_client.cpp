@@ -495,12 +495,12 @@ bool LogosAPIClient::informModuleToken(const std::string& authToken, const std::
                              QString::fromStdString(token));
 }
 
-bool LogosAPIClient::informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token)
+bool LogosAPIClient::informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs)
 {
     // The origin-module variant also acquires a transport replica.
     return logos::runOnOwnerThread(this, [&]() {
         return m_consumer->informModuleToken_module(authToken, originModule,
-                                                     moduleName, token);
+                                                     moduleName, token, timeoutMs);
     });
 }
 

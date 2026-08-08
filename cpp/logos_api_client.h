@@ -291,7 +291,7 @@ public:
     bool informModuleToken(const char* authToken, const char* moduleName, const char* token)
         { return informModuleToken(QString(authToken), QString(moduleName), QString(token)); }
     bool informModuleToken(const std::string& authToken, const std::string& moduleName, const std::string& token);
-    bool informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token);
+    bool informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs = 20000);
 
     // Register a bootstrap token for one explicit target instance with an
     // instance-aware capability module. The trusted auth token is sent both
