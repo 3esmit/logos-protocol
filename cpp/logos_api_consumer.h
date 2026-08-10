@@ -8,17 +8,20 @@
 #include <QHash>
 #include <QSet>
 #include <QMap>
+#include <QStringList>
 #include <functional>
 #include <memory>
 #include <string>
 
 #include "logos_call_error.h"
 #include "logos_mode.h"
+#include "logos_subscription_state.h"
 #include "logos_transport_config.h"
 
 class LogosTransportConnection;
 class LogosObject;
 class TokenManager;
+class LogosPendingSubscriptions;
 
 /**
  * @brief LogosAPIConsumer handles connecting to module objects and invoking their methods
@@ -140,8 +143,99 @@ public:
      * @param eventName The name of the event to listen for
      * @param callback Function to call when the event is triggered
      */
-    void onEvent(LogosObject* originObject, const QString& eventName, 
+    void onEvent(LogosObject* originObject, const QString& eventName,
                 std::function<void(const QString&, const QVariantList&)> callback);
+
+    /**
+     * @brief Subscribe to an event on an object that MAY NOT EXIST YET.
+     *
+     * requestObject() + onEvent() asks "is the module there right now?" — the
+     * wrong question for a subscription. A UI plugin subscribes while its
+     * dependency's host process has been spawned but has not yet called
+     * listen(), so the honest answer is "no", and a one-shot caller then never
+     * asks again. Method calls kept working through this window only because
+     * they reach the replica by a path that does not ask.
+     *
+     * This arms the subscription as soon as the object is reachable — now, or
+     * whenever the module appears, including a mid-session package install.
+     * It never blocks and never spins a nested event loop, so it is safe from a
+     * GUI thread.
+     *
+     * Cost of waiting: on the qt_remote transport, ZERO extra polling — one
+     * pending QRemoteObjectDynamicReplica, armed by the node's existing 250 ms
+     * reconnect loop. On transports without deferred acquire (qt_local, mock,
+     * plain) this runs ONE shared timer per consumer with 250 ms → 5 s backoff,
+     * whose per-tick cost is a registry hash lookup / in-memory socket check.
+     *
+     * Unbounded on purpose: any finite give-up would silently break the
+     * mid-session-install case. What IS bounded is the NOISE — one warning per
+     * (object, event) when a subscription is first deferred, one more if it is
+     * still pending after 60 s, then quiet; a qInfo when it finally arms; and a
+     * loud warning if it becomes permanently impossible.
+     *
+     * All subscriptions to the same object share ONE handle (one replica),
+     * separate from the call-path handle cache so that a call re-acquiring a
+     * stale handle cannot silently kill a live subscription.
+     *
+     * NOT deduplicated: two identical calls produce two live subscriptions and
+     * therefore two callbacks per event. Callers that must not double-deliver
+     * (e.g. QML re-running Component.onCompleted) dedupe on their own side, and
+     * should verify with eventSubscriptionState() rather than assuming their
+     * own record is still accurate.
+     *
+     * WHAT THIS DOES NOT PROMISE. Arming is not retroactive and the transports
+     * do not buffer, so there is a window — roughly the 50-150 ms between a
+     * module's socket appearing and the replica reaching Valid — in which an
+     * event the module emits is not delivered to anyone. A module that fires a
+     * one-shot "ready"/"started" event synchronously inside its own init() can
+     * still be missed. This is inherent to the transport, not introduced here
+     * (the blocking requestObject() this replaced had exactly the same window),
+     * but "subscriptions survive a late module" is not "no event can be
+     * missed": a module whose startup event matters must also expose a pull
+     * method the subscriber can call after arming.
+     *
+     * @param onArmed Optional; called with true the moment the subscription
+     *                goes live, or false if it is abandoned. Never called for
+     *                "not yet".
+     * @return A non-zero id for cancelEventSubscription() /
+     *         eventSubscriptionState(), or 0 if the arguments were refused.
+     */
+    quint64 onEventWhenAvailable(const QString& objectName,
+                                 const QString& eventName,
+                                 std::function<void(const QString&, const QVariantList&)> callback,
+                                 std::function<void(bool)> onArmed = {});
+
+    /**
+     * @brief Stop tracking the subscription with this id.
+     *
+     * A subscription that is still PENDING leaves the registry entirely, so it
+     * stops holding the retry timer up and stops the watchdog warning about a
+     * subscription nobody wants. One that has already ARMED is dropped from the
+     * re-arm set so a later reconnect does not resurrect it.
+     *
+     * Does NOT detach the callback from the shared handle — LogosObject offers
+     * no per-callback removal, only clearEventSubscriptions(), which would take
+     * out every other subscriber on that handle. A caller that must stop
+     * delivery gates its own callback (lp_unsubscribe does).
+     *
+     * @return true if the id was known.
+     */
+    bool cancelEventSubscription(quint64 subscriptionId);
+
+    /**
+     * @brief Whether a subscription id is still pending, armed, or forgotten.
+     *
+     * Lets a caller that keeps its own de-duplication record check it against
+     * the registry instead of trusting it — an assumed-live record that is
+     * actually gone turns a re-subscribe into a silent no-op.
+     */
+    LogosSubscriptionState eventSubscriptionState(quint64 subscriptionId) const;
+
+    /**
+     * @brief Diagnostics: "<object>::<event>" for every subscription registered
+     *        via onEventWhenAvailable() that has not armed yet.
+     */
+    QStringList pendingSubscriptions() const;
 
 public slots:
     bool informModuleToken(const QString& authToken, const QString& moduleName, const QString& token);
@@ -181,6 +275,16 @@ private:
     // existed would pay the full probe budget on every single grant. Cleared by
     // clearObjectCache() so a reconnect or a reloaded module is re-probed.
     QSet<QString> m_noHandshakeSurface;
+
+    // Deferred event subscriptions (onEventWhenAvailable). Appended LAST and
+    // held by pointer on purpose: an opaque forward declaration keeps this
+    // header's size stable and keeps every piece of the registry's state as
+    // instance state. It must never become a function-local or file-scope
+    // static in a header — PE has no symbol interposition, so a static inside
+    // an inline function is per-IMAGE, and Basecamp would get one registry per
+    // DLL (the same shape as the three-TokenManagers bug). Owned; deleted in
+    // the destructor. Defined in logos_api_consumer.cpp.
+    LogosPendingSubscriptions* m_pendingSubs = nullptr;
 };
 
 #endif // LOGOS_API_CONSUMER_H

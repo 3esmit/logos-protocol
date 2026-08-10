@@ -223,16 +223,56 @@ int lp_invoke_async(lp_client* client,
 /**
  * Subscribe to `event_name` emitted by the client's target module.
  * `cb` fires once per event with the payload as a JSON array.
- * Returns NULL on failure (e.g. the target object cannot be acquired).
+ *
+ * The target module does NOT have to be reachable yet. This is the normal
+ * case, not an edge case: a module subscribes to its dependency during init(),
+ * and a ui_qml backend during onContextReady(), both of which run while the
+ * dependency's host has been spawned but has not called listen(). The
+ * subscription is held and armed when the module appears — including a
+ * mid-session package install — so a NULL return means the ARGUMENTS were
+ * refused, never "not there yet".
+ *
+ * What it does not promise: arming is not retroactive and no transport buffers,
+ * so an event the module emits in the window before the subscription arms
+ * reaches nobody. A module that fires a one-shot "ready" event synchronously
+ * inside its own init() can still be missed; if that event matters, expose a
+ * method the subscriber can call after subscribing.
+ *
+ * Returns NULL only for a null/empty client, event name or callback.
  */
 lp_subscription* lp_subscribe(lp_client* client,
                               const char* event_name,
                               lp_event_cb cb,
                               void* user_data);
 
-/** Cancel a subscription. After this returns the callback will not fire
- *  again (already-running invocations are allowed to finish first). */
+/** Cancel a subscription. After this returns the callback will not fire again
+ *  (already-running invocations are allowed to finish first) — that part is
+ *  synchronous and unconditional.
+ *
+ *  The client also stops TRACKING it, so a subscription cancelled while still
+ *  waiting for its module leaves the retry machinery instead of being warned
+ *  about forever. That half is EVENTUAL, not immediate: it is posted to the
+ *  client's owner thread and takes effect on a later turn of that thread's
+ *  event loop. Doing it synchronously would mean blocking on the owner thread
+ *  while holding a lock that thread's delivery callback also takes — a
+ *  deadlock, and an outright hang once that event loop has stopped, which is
+ *  exactly when a language binding's subscription handle is dropped.
+ *
+ *  Consequence for callers: lp_pending_subscriptions() may still list a
+ *  just-cancelled subscription until the owner thread runs. If the client is
+ *  destroyed first the cancellation simply never runs, which is correct — the
+ *  registry died with it. */
 void lp_unsubscribe(lp_subscription* sub);
+
+/** Diagnostics: a JSON array of "<module>::<event>" for every subscription on
+ *  this client that has been accepted but has not armed yet — i.e. is waiting
+ *  for its module to appear. `[]` when everything is live.
+ *
+ *  Exists because the Qt consumer has had this visibility all along and the C
+ *  ABI had none, which is precisely why a subscription that silently never
+ *  armed was undetectable from Rust, Nim or a universal C++ module. Caller
+ *  frees via lp_string_free; NULL only for a null client. */
+char* lp_pending_subscriptions(lp_client* client);
 
 /** Introspect the target module's methods/events as a JSON array (the
  *  same shape `lm` prints). Caller frees via lp_string_free. NULL on
