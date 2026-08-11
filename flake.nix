@@ -8,11 +8,17 @@
     let
       systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f {
+        inherit system;
         pkgs = import nixpkgs { inherit system; };
       });
+
+      # Adds the "x86_64-windows" pseudo-system. A cross derivation's `system`
+      # attribute is its BUILD platform, so packages.x86_64-windows.* evaluates
+      # anywhere but realises on x86_64-linux.
+      forAllTargets = logos-nix.lib.forAllTargets;
     in
     {
-      packages = forAllSystems ({ pkgs }:
+      packages = forAllTargets ({ pkgs, ... }:
         let
           common = import ./nix/default.nix { inherit pkgs; };
           src = ./.;
@@ -43,7 +49,7 @@
         }
       );
 
-      checks = forAllSystems ({ pkgs }:
+      checks = forAllSystems ({ pkgs, ... }:
         let
           common = import ./nix/default.nix { inherit pkgs; };
           src = ./.;
@@ -54,7 +60,7 @@
         }
       );
 
-      devShells = forAllSystems ({ pkgs }: {
+      devShells = forAllSystems ({ pkgs, ... }: {
         default = pkgs.mkShell {
           nativeBuildInputs = [
             pkgs.cmake
