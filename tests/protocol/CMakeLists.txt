@@ -1,20 +1,46 @@
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 
-# ── validating the detectors ────────────────────────────────────────────────
+# ── which of these tests are detectors, and how that was checked ─────────────
 #
-# A race assertion that has never been seen to fail is not evidence, so the race
-# tests in this directory are checked against the code they were written for:
-# copy the test file onto the pre-fix tree and run it there. For the completion
-# subscription that tree is `master` — it has both the racy ensureCompletionSub()
-# and the raw-`this` handler capture — and the numbers those runs produced are
-# recorded in the test files themselves.
+# A race assertion that has never been seen to fail is not evidence. Three of the
+# guarantees in this suite are single points of mechanism — the exactly-once CAS
+# in AsyncCall::deliver(), the deadline living on its own thread rather than the
+# shared io thread, and the serialization that keeps a concurrent first caller
+# from outrunning the completion subscription — so each was checked by running
+# the tests against code that does not have it.
 #
-# Deliberately no build flag, no environment probe and no second implementation
-# in the shipped source. An earlier draft carried both, and the cost is the same
-# either way: production code grows a path whose only purpose is to be wrong.
-# Running the real pre-fix code is also the stronger evidence, because it proves
-# the test catches the bug that actually existed rather than a hand-written
-# imitation of it.
+# That check is done on the PRE-FIX TREE, not on a switch in this one: copy the
+# test file onto the commit the fix replaced and run it there. For the completion
+# subscription that tree is `master`, which still has both the racy
+# ensureCompletionSub() and the raw-`this` handler capture; for the fold's two
+# mechanisms it is a local edit to the transport, made in a throwaway checkout
+# and thrown away with it. The numbers each run produced are recorded in the test
+# files themselves.
+#
+# Deliberately not a build option, and not the environment-variable probes an
+# earlier draft carried. Both have the same cost, which the getenv() version only
+# made more obvious: production source ends up holding a second implementation of
+# its own contract whose entire purpose is to be wrong, in a change whose entire
+# purpose is correctness. Running the real pre-fix code is also better evidence,
+# because it proves the test catches the bug that existed rather than a
+# hand-written imitation of it.
+#
+# WHICH TESTS ARE DETECTORS, since it is not all of them and the difference
+# matters when one goes green. Only these fail on code missing the mechanism:
+#
+#   IoFoldTest.ReleaseRacingRepliesInFlightDeliversEachCallOnce
+#   IoFoldTest.DeadlineFiresOnTimeWhileTheIoThreadIsBusy
+#   IoFoldTest.DeadlineFiresWhileTheIoThreadIsBlockedForever
+#   PlainCompletionSubOrderTest.AConcurrentFirstCallCannotOutrunTheSubscription
+#   PlainCompletionSubOrderTest.TheSameRaceThroughTheRealHost
+#   PlainCancelPendingRaceTest.AnExtractedReplyRacingTeardownDeliversExactlyOnce
+#
+# Note what is NOT on that list: the PER-PATH exactly-once tests stay GREEN with
+# the CAS removed. They are PINS, NOT DETECTORS — a call resolved once calls
+# deliver() once no matter what guards it — and only racing teardown against
+# replies in flight (the first entry) and the hand-built extract-then-cancel
+# interleaving (the last) actually catch a doubled callback. Do not read a green
+# per-path test as evidence the gate is there.
 
 add_executable(protocol_tests
     test_main.cpp
@@ -73,33 +99,35 @@ add_executable(protocol_tests
     # is not silently plain-TCP-only. Exercises the deferred-completion timeout,
     # which needs no blocking provider and therefore no second event loop.
     test_call_error_qt_remote.cpp
-    # Teardown of a PlainLogosObject with a call still IN FLIGHT. Joining the
-    # per-call waiters closed a use-after-free but left release() blocking for
-    # the remainder of the call's timeout (up to the 20s default), because
-    # joinWaiters() could only join, never ask a waiter to stop. Pins all three
-    # halves of the fix: teardown costs one wait slice, the callback still fires
-    # EXACTLY ONCE on every outcome including cancellation (a waiter that just
-    # returns turns a stall into a hang), and the join that keeps `this` alive
-    # under the waiter is still there.
+    # Teardown of a PlainLogosObject with a call still IN FLIGHT. Written when
+    # in-flight calls were threads: joining them closed a use-after-free but left
+    # release() blocking for the remainder of the call's timeout, so they were
+    # asked to stop first and teardown cost one 25ms wait slice. Public API only,
+    # so the io_context fold did not touch it — but its BOUNDS are now loose
+    # rather than tight: there is no wait slice any more (0ms, measured) and no
+    # join, because nothing captures `this`. What it still pins exactly is the
+    # part that matters most: the callback fires EXACTLY ONCE on every outcome
+    # including cancellation, since a dropped one turns a stall into a hang.
     test_plain_object_teardown.cpp
     # The other half of the same mechanism: what a COMPLETED call leaves behind.
-    # A waiter cannot join itself, so while the registry was a plain vector the
-    # only thing that ever emptied it was teardown, and every finished call
-    # parked an unjoined thread (~one page of resident memory) for the life of
-    # the handle — unbounded under the cached-handle shape LogosAPIConsumer
-    # actually uses. Pins the registry not growing with call count, the
-    # reap-vs-publish race not deadlocking, and teardown still joining what is
-    # left.
+    # Written for the waiter registry (a map of threads plus a publish list) and
+    # retargeted by the io_context fold at the registry that replaced it,
+    # CallState::inflight. The claims are unchanged and are why it survived the
+    # rework: retention must not grow with call count, a burst that goes idle
+    # must drain with no further call, and teardown must still deliver exactly
+    # once.
     test_plain_waiter_reaping.cpp
-    # The ordering rule the other two rest on: publishFinishedWaiter() is a
-    # waiter's LAST access to the object, which is the only reason
-    # stopAndJoinWaiters() can return while a reaper is still mid-join on a
-    # waiter it has already taken out of m_waiters. No supported caller can
-    # provoke the use-after-free an extra access below the publish would create,
-    # so this observes the accesses directly: the object is placed across a page
-    # boundary at m_waiterMu and its non-registry page is guarded while a waiter
-    # runs.
-    test_plain_waiter_publish_is_last.cpp
+    # test_plain_waiter_publish_is_last.cpp — DELETED BY THE io_context FOLD.
+    # It pinned one rule: publishFinishedWaiter() is a waiter thread's LAST
+    # access to the object, which was the only reason stopAndJoinWaiters() could
+    # return while a reaper was still mid-join on a waiter it had already taken
+    # out of m_waiters. There are no waiter threads, no reaper and no publish
+    # list any more, so there is no ordering left to pin — the property it
+    # protected ("no handler touches the object after teardown") is structural
+    # now: handlers hold a weak_ptr to CallState and never dereference the
+    # handle. test_iofold.cpp OBSERVES that instead of pinning the protocol that
+    # used to be needed for it.
+    test_iofold.cpp
     # The OTHER thing release() leaves behind: the deferred-completion event
     # subscription. Its handler captured raw `this` and lives in the
     # RpcConnection, which is shared across every handle and outlives all of
@@ -115,6 +143,13 @@ add_executable(protocol_tests
     # subscription the host had not registered and the completion was dropped.
     # Costs a caller its whole timeout and leaves nothing behind — see the file.
     test_plain_completion_sub_order.cpp
+    # cancelPending() and the two things it is NOT. dispatchIncoming copies a
+    # handler out under the connection mutex and invokes it unlocked, so a
+    # cancel arriving in that gap stops nothing — at-most-once INVOCATION is the
+    # extract-and-erase, and exactly-once DELIVERY is AsyncCall::deliver()'s CAS.
+    # Constructs the interleaving by hand rather than racing for it, and covers
+    # the OTHER handler shape (the promise sendCall registers) too.
+    test_plain_cancel_pending_race.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp
