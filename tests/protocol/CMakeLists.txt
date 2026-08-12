@@ -35,6 +35,30 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 #   PlainCompletionSubOrderTest.TheSameRaceThroughTheRealHost
 #   PlainCancelPendingRaceTest.AnExtractedReplyRacingTeardownDeliversExactlyOnce
 #   PlainSendAfterFailTest.*   (all four; validated on cf1b9b0)
+#   SyncCallReleaseRaceTest.ReleaseWithASyncCallInFlightIsReportedAndFatal
+#   SyncCallReleaseRaceTest.AParkedSyncCallSurvivesReleaseFromAnotherThread
+#   SyncCallReleaseRaceTest.ReleaseDefersDestructionToTheLastCallInFlight
+#   SyncCallReleaseRaceTest.TheReleaseWakeRaceIsSafeEveryTime   (under gmalloc)
+#   SyncCallReleaseRaceTest.DeletingTheHandleWithACallInFlightIsReportedAndFatal
+#   SyncCallReleaseRaceTest.StartingACallAfterReleaseIsReportedAndFatal
+#   SyncCallReleaseRaceTest.EveryEntryPointLeavesTheCountAtZero
+#   SyncCallReleaseRaceTest.ConcurrentCallersThatHaveReturnedAreNotAccused
+#   SyncCallReleaseRaceTest.ReleaseFromInsideAnEventCallbackIsNotAccused
+#   every test in NoQtLoopTest (protocol_noqt_tests — see the second executable
+#   at the bottom of this file), including the after-main() probe whose verdict
+#   is that binary's EXIT CODE
+#
+# The release-race group is three detectors of three different things, which is
+# why all of it is listed. THE FIX: on cf1b9b0 the survival test's child dies by
+# signal ("died but not with expected exit code") and the deferred-destruction
+# test exits 139, both three runs out of three; the release-wake stress is silent
+# there without Guard Malloc and 139 with it, which is why it is marked. THE
+# REMAINING MISUSES: the two death tests fail on cf1b9b0 (no diagnostic exists to
+# match). A BROKEN DETECTOR: with the decrement removed from EntryGuard's
+# destructor the three "not accused" tests abort on a correct program, which is
+# the failure mode that would make the whole thing unshippable. Every one of
+# those was checked by running it — against the pre-fix commit for the first two
+# groups, against a throwaway local edit for the last.
 #
 # Note what is NOT on that list: the PER-PATH exactly-once tests stay GREEN with
 # the CAS removed. They are PINS, NOT DETECTORS — a call resolved once calls
@@ -50,6 +74,16 @@ find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 # calls while PlainSendAfterFailTest's own 10,000-call burst — which stops the
 # CONNECTION mid-burst — reports 5 to 10. Same shape, different contended object,
 # and only the second one sees that path.
+# AND "THE CAS" IS TWO GATES, which is a correction to the paragraph above and
+# was found while re-validating this on the no-Qt binary. AsyncCall guards a
+# duplicate delivery twice: claim()'s compare-exchange, and the swap in
+# takeCallback() that leaves a second caller holding an empty std::function.
+# Removing the CAS ALONE leaves every test here green (0 doubles) because the
+# swap absorbs the duplicate; removing BOTH makes the release-race shape report
+# 22 doubled deliveries in 20 rounds x 500 calls while the per-path tests stay
+# green. Measured on the no-Qt twin
+# (NoQtLoopTest.ReleaseRacingRepliesDeliversEachCallOnceWithNoQtLoop). A
+# validation that removes one of the two proves nothing.
 
 add_executable(protocol_tests
     test_main.cpp
@@ -168,6 +202,20 @@ add_executable(protocol_tests
     # Builds the interleaving by parking the caller on the connection's own
     # mutex rather than racing for it.
     test_plain_send_after_fail.cpp
+    # release() racing a call still running on another thread — a PRE-EXISTING
+    # use-after-free (reproduced identically on master, on #45 and on #46), now
+    # FIXED by a live-reference count: release() drops the owner's reference and
+    # the last call to leave destroys the object, so a call that entered first is
+    # safe and release() still waits for nothing. This file pins the fix (the
+    # reproduction survives, destruction is deferred and happens exactly once,
+    # the tight release-wake race 400 times over), pins the two shapes that are
+    # still caller errors (`delete obj` with a call in flight, and STARTING a
+    # call after release()) as named aborts rather than a SIGSEGV elsewhere, and
+    # — the half that decides whether a diagnostic is shippable at all — pins
+    # that a correct program is never accused: every entry point, every
+    # early-return path, many threads at once, and the shipped
+    # release()-from-an-io-thread-event-callback shape.
+    test_sync_call_release_race.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp
@@ -245,3 +293,50 @@ target_link_libraries(protocol_tests PRIVATE
 )
 
 gtest_discover_tests(protocol_tests)
+
+# ── the Qt-LOOP-FREE half ────────────────────────────────────────────────────
+#
+# A SECOND executable, for one reason: QCoreApplication is a process-wide
+# singleton and protocol_tests' main() constructs it before the first test runs,
+# so no test in that binary can ever observe the state a Qt-free host process is
+# permanently in — instance() == nullptr. That state is where the async delivery
+# hop dropped every callback on the floor, and a test that cannot reach it
+# cannot detect it. Destroying the application partway through the main run to
+# get there would be a far worse trade than one more binary.
+#
+# Everything here links the same library and exercises the same code paths; only
+# main() differs. See test_main_noqt.cpp.
+add_executable(protocol_noqt_tests
+    test_main_noqt.cpp
+    # The async delivery hop, in a process with no Qt event loop. It read
+    # QCoreApplication::instance() and RETURNED when it was null, so in a
+    # Qt-free host — the deployment the plain transport exists for — every
+    # async callback was dropped: exactly-once became exactly-never, silently,
+    # on all four resolvers (reply, deferred completion, deadline,
+    # cancellation). Pins that each of them now lands, that none of them lands
+    # inline or on the io thread (which is the re-entrancy class that has
+    # already cost a SIGSEGV here, so a "just call it inline" fix would be
+    # worse than the bug), and that exactly-once survives the release-racing-
+    # replies shape against the new delivery vehicle.
+    #
+    # It also carries a probe that runs AFTER main() returns — a delivery issued
+    # from a static destructor, which is where a lazily-constructed delivery
+    # vehicle is already destroyed. Its verdict is this binary's EXIT CODE (70 on
+    # failure), because no test case runs in that window; see LateDeliveryProbe.
+    # That is also why a failure there shows up as a build-time error from
+    # gtest_discover_tests, which runs this binary to enumerate its tests.
+    test_delivery_without_qt.cpp
+)
+
+target_include_directories(protocol_noqt_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(protocol_noqt_tests PRIVATE
+    logos_protocol
+    GTest::gtest
+    Qt${QT_VERSION_MAJOR}::Core
+    Qt${QT_VERSION_MAJOR}::RemoteObjects
+)
+
+gtest_discover_tests(protocol_noqt_tests)

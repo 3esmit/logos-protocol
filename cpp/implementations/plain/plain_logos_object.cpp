@@ -20,6 +20,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
 #include <future>
 #include <string>
 #include <thread>
@@ -96,7 +99,7 @@ logos::CallError callErrorReleased(const std::string& objectName,
 // fire timers. It restores the independence the per-call waiter threads had, at
 // one thread instead of one per pending call, which is the entire point of the
 // fold. Nothing else may ever be posted here; user code reaches the Qt loop via
-// postToQtEventLoop, and AsyncCall::deliver() is a flag, two map erases and a
+// postDelivery, and AsyncCall::deliver() is a flag, two map erases and a
 // post.
 // -----------------------------------------------------------------------------
 class DeadlineService {
@@ -145,23 +148,194 @@ boost::asio::io_context& deadlineContext()
     return DeadlineService::shared().context();
 }
 
-// Hand `callback(result)` over to the Qt event loop so PlainLogosObject's
-// async path matches LogosObject's interface contract: callbacks are
-// always delivered on a subsequent event-loop iteration, on the Qt
-// thread, never synchronously and never racing with QObjects/UI code.
+// -----------------------------------------------------------------------------
+// DeliveryService — the thread user callbacks land on in a process that has NO
+// Qt event loop. A THIRD singleton thread, and the reasons it is neither of the
+// other two are the whole design.
 //
-// Using QCoreApplication::instance() as the anchor means the queued
-// invocation lands on whichever thread runs the Qt event loop in this
-// process, regardless of which worker thread completed the call.
-// If the application has shut down (instance() is null), we drop the
-// callback rather than invoke it from an arbitrary thread.
+// WHAT WAS WRONG. The delivery hop below used to be exactly this:
+//
+//     QCoreApplication* app = QCoreApplication::instance();
+//     if (!app) return;                       // <- the callback, dropped
+//
+// In a Qt host that branch only fires after QCoreApplication is gone, i.e.
+// during shutdown, which is why it read as a reasonable guard. In a host that
+// never had one it fires for EVERY call, forever: callMethodAsyncWithError,
+// lp_invoke_async and every generated async wrapper promise their callback
+// exactly once, and the plain transport — the transport whose entire reason for
+// existing is to work without Qt — delivered zero. Not an error, not a
+// timeout: silence, which turns a bounded call into an unbounded wait in every
+// caller that awaits it. The header's guarantee was unconditional and untrue.
+//
+// WHAT IT IS NOT, which is the constraint that rules out the obvious fix.
+// "Just call it inline when there is no loop" would run user code on whatever
+// stack completed the call — the Asio read handler on the connection's strand,
+// the deadline thread, or the middle of release(). That is the re-entrancy
+// class this codebase has already paid for once: a deferred-multi completion
+// running inline on the QtRO read stack, SIGSEGV, fixed by pushing it off the
+// stack with QTimer::singleShot(0) (remote_transport.cpp). The whole point of
+// this hop is that no user callback ever runs on an Asio handler stack, and a
+// fix that delivers by removing the hop is not a fix.
+//
+// NOR IS IT THE DEADLINE THREAD. Posting user callbacks onto DeadlineService
+// would make every deadline in the process hostage to user code — a callback
+// that makes a synchronous call, or blocks, stops the clock for every other
+// pending call. That is precisely the coupling DeadlineService was extracted to
+// prevent, and its comment above says nothing else may ever be posted there.
+// One thread each, therefore, and they cost nothing until used: a Qt host never
+// starts this one at all.
+//
+// NOR IS IT "fail the call at issue time when there is no loop". That answer
+// would make the plain transport unusable in exactly the deployment it was
+// built for, and it still needs somewhere to deliver the failure it invents.
+//
+// ORDERING. A single thread draining a FIFO, so callbacks are delivered in the
+// order they were resolved — the same property the Qt queued connection gives.
+//
+// AND IT IS NEVER DESTROYED, which is the one design decision in this class that
+// is not obvious and is not free. The first cut made it an ordinary
+// function-local static, and that is a use-after-free: a function-local static
+// is constructed on FIRST DELIVERY, so anything with static storage that was
+// constructed earlier — which is everything constructed before the first async
+// call in the process — is destroyed LATER. Its destructor's delivery then posts
+// into an io_context that has already run its own destructor, on a thread that
+// has already been joined. Reproduced with nothing but the null-connection
+// early-return path: three runs out of three, SIGSEGV under Guard Malloc inside
+// scheduler::post_immediate_completion, reached from a static destructor through
+// __cxa_finalize; and without Guard Malloc, silently, as delivered=0 — the very
+// drop this class exists to fix, moved to a later moment.
+//
+// SO THE OBJECT OUTLIVES EVERY POSSIBLE CALLER, by never being destroyed at all
+// and never registering a destructor to run. A deliberate, bounded leak: ONE
+// io_context and ONE thread, in a process that is ending. What it buys is that
+// postDelivery has no shutdown window — there is no state in which the vehicle
+// is gone but callers remain — so a delivery issued from a static destructor
+// after main() has returned still lands on a live delivery thread. Pinned by a
+// probe that runs after main() in tests/protocol/test_delivery_without_qt.cpp.
+//
+// AND PROCESS EXIT MUST NOT WAIT FOR IT, which is why the thread is DETACHED
+// rather than merely un-joined. exit() does not join threads, so an abandoned
+// thread cannot hold the process open; detaching says so at the one place a
+// future reader would otherwise reintroduce a join. Note what the old
+// destructor's own comment was worried about — a user callback that blocks
+// forever at static-destruction time hanging the join — and that this shape
+// cannot have that failure at all, because there is no join. The hazard was
+// always the reverse of what that comment described: the service died before its
+// callers did.
+//
+// WHAT THE LEAK COSTS, stated rather than waved past. One thread lives from the
+// first Qt-free async delivery to process exit, where it is sitting in the
+// kernel waiting for work; and a callback that is RUNNING when the process exits
+// can be cut off mid-flight, exactly as a Qt slot can be when the event loop's
+// thread is torn down. What it cannot do is post into freed memory, which is
+// what the alternative did.
+class DeliveryService {
+public:
+    static DeliveryService& shared()
+    {
+        // Lazy, like IoContextPool::shared() and DeadlineService::shared(): a
+        // process with a Qt event loop never constructs this and never starts
+        // its thread. `new`, and never deleted: a function-local static of
+        // OBJECT type would register a destructor with __cxa_atexit, which is
+        // precisely the ordering hazard above. A pointer initialised once has no
+        // destructor to register, so nothing about the moment of first use — the
+        // middle of static destruction included — can leave a caller holding a
+        // dead service.
+        static DeliveryService* const svc = new DeliveryService();
+        return *svc;
+    }
+
+    void post(std::function<void()> fn)
+    {
+        boost::asio::post(m_ioc, std::move(fn));
+    }
+
+    DeliveryService(const DeliveryService&) = delete;
+    DeliveryService& operator=(const DeliveryService&) = delete;
+
+private:
+    DeliveryService()
+        : m_guard(boost::asio::make_work_guard(m_ioc))
+        , m_thread([this] { m_ioc.run(); })
+    {
+        // Detached at birth. Nothing will ever join it — see the note above —
+        // and saying so here is what stops a future edit from adding a join to a
+        // thread whose io_context is never stopped, which would hang exit()
+        // forever rather than not at all.
+        m_thread.detach();
+    }
+
+    // DELIBERATELY NOT DESTRUCTIBLE. The compiler now enforces what the comment
+    // asks for: no `static DeliveryService svc;`, no unique_ptr, no `delete`,
+    // and therefore no way to reintroduce a destroyed-before-its-callers
+    // service by accident. `new` needs no destructor, so shared() still
+    // compiles.
+    ~DeliveryService() = delete;
+
+    boost::asio::io_context m_ioc;
+    boost::asio::executor_work_guard<boost::asio::io_context::executor_type> m_guard;
+    std::thread m_thread;
+};
+
+// Hand `callback(result, err)` over to a LATER stack, so PlainLogosObject's
+// async path matches LogosObject's interface contract: callbacks are never
+// delivered synchronously inside the call that issued them, and never on the
+// transport's io thread.
+//
+// TWO VEHICLES, one rule. When this process runs a Qt event loop the callback
+// is queued onto it exactly as before, so it lands on the Qt thread and cannot
+// race QObjects or UI code — unchanged behaviour for every Qt host. When this
+// process has never had one, the callback goes to the dedicated delivery thread
+// above instead of being dropped. Nothing in between: there is no path that
+// runs it on the completing thread.
+//
+// WHY "HAS NEVER HAD ONE" AND NOT "DOES NOT HAVE ONE RIGHT NOW", which is the
+// one subtlety in this function. instance() also goes null during
+// ~QCoreApplication, so the naive test would start delivering on a foreign
+// thread while the Qt app is being torn down — and module teardown after the
+// application is gone is not exotic, it is what static-destruction ordering
+// produces, with stopAndCancelCalls() handing every in-flight call a
+// cancellation callback at exactly that moment. Running user code on a side
+// thread into half-destroyed module state is a worse outcome than not running
+// it, and it would be a NEW failure mode introduced into every Qt app by a
+// bug-fix change. So the flag latches: a process that has ever been seen with
+// an event loop keeps the old shutdown behaviour (the callback is dropped),
+// and a process that has never had one gets the delivery thread. A Qt host
+// therefore sees no behavioural difference at all — which is the point.
+//
+// THE RESIDUE, ENUMERATED, because "exactly once" was untrue here once already
+// and a vague replacement is how that happens twice. Three shapes do NOT get a
+// delivery, and all three are properties of the host process, not of the call:
+//
+//   1. A Qt process AFTER ~QCoreApplication. The callback is dropped, by the
+//      decision above.
+//   2. A process that constructs a QCoreApplication and never runs its event
+//      loop. The delivery is queued onto a loop that never turns, so it never
+//      runs. Nothing here can fix that: the callback's whole contract is that it
+//      arrives on the Qt thread, and delivering it anywhere else would be the
+//      thread-affinity violation this hop exists to prevent. Not new, not
+//      introduced here — this is what "queue it onto the Qt loop" has always
+//      meant — but it is a case where the header used to promise exactly once,
+//      so it is named.
+//   3. A process that had a QCoreApplication TRANSIENTLY — constructed and
+//      destroyed while the process goes on to run Qt-free. The latch keeps
+//      dropping for the rest of that process's life. It is the price of the
+//      choice in (1): from inside postDelivery, "the app is gone because the
+//      process is shutting down" and "the app is gone because a helper's app
+//      object went out of scope" are the same observation, and getting (1) wrong
+//      breaks every existing Qt host at exit while getting (3) wrong breaks a
+//      shape no host in this codebase has. The trade is deliberate and is not
+//      hidden: the guarantee below is worded as "a process with no
+//      QCoreApplication in its life", not "a process without one right now".
+//
+// logos_object.h states all three where callers read the contract.
 //
 // Deliberately a FREE function taking everything BY VALUE, and deliberately not
-// a member: the queued lambda runs on a later event-loop iteration, which for a
-// call cancelled by teardown is after the PlainLogosObject is already gone.
-// Nothing it touches may belong to the object — which is why AsyncCall copies
-// objectName/method up front instead of reading m_objectName from inside here.
-// Do not give this a `this`.
+// a member: the queued lambda runs later, which for a call cancelled by
+// teardown is after the PlainLogosObject is already gone. Nothing it touches
+// may belong to the object — which is why AsyncCall copies objectName/method up
+// front instead of reading m_objectName from inside here. Do not give this a
+// `this`.
 //
 // THE FOLD MADE THIS LOAD-BEARING TWICE OVER. It was already the reason a
 // delivery could outlive the handle. It is now also the answer to the
@@ -172,17 +346,31 @@ boost::asio::io_context& deadlineContext()
 // ever runs on an Asio handler stack. That is the class of bug that produced the
 // deferred-multi SIGSEGV on the QtRO twin, whose fix (remote_transport.cpp) is
 // the same move by a different vehicle: QTimer::singleShot(0).
-void postToQtEventLoop(PlainLogosObject::AsyncResultErrorCallback callback,
-                       QVariant result, logos::CallError err)
+// Latched the first time an event loop is seen; never cleared. See postDelivery.
+std::atomic<bool> g_processHadQtLoop{false};
+
+void postDelivery(PlainLogosObject::AsyncResultErrorCallback callback,
+                  QVariant result, logos::CallError err)
 {
-    QCoreApplication* app = QCoreApplication::instance();
-    if (!app) return;
-    QMetaObject::invokeMethod(app,
+    if (QCoreApplication* app = QCoreApplication::instance()) {
+        g_processHadQtLoop.store(true, std::memory_order_relaxed);
+        QMetaObject::invokeMethod(app,
+            [callback = std::move(callback), result = std::move(result),
+             err = std::move(err)]() mutable {
+                callback(result, err);
+            },
+            Qt::QueuedConnection);
+        return;
+    }
+    // The application existed and is gone: this is shutdown, and the old
+    // behaviour — drop it — is deliberately kept. See above.
+    if (g_processHadQtLoop.load(std::memory_order_relaxed)) return;
+
+    DeliveryService::shared().post(
         [callback = std::move(callback), result = std::move(result),
          err = std::move(err)]() mutable {
             callback(result, err);
-        },
-        Qt::QueuedConnection);
+        });
 }
 
 } // anonymous namespace
@@ -332,7 +520,7 @@ struct AsyncCall : std::enable_shared_from_this<AsyncCall> {
 
         cancelTimer();
         // Last, and never with a lock held: the delivery hop.
-        if (cb) postToQtEventLoop(std::move(cb), std::move(value), std::move(err));
+        if (cb) postDelivery(std::move(cb), std::move(value), std::move(err));
     }
 
     // Callable from ANY thread: the arm is POSTED onto the timer's own strand,
@@ -371,6 +559,185 @@ struct AsyncCall : std::enable_shared_from_this<AsyncCall> {
     }
 };
 
+// -----------------------------------------------------------------------------
+// The live-reference count that makes release() safe against a call already
+// running, and the detector beside it for the shapes it cannot save. Two
+// counters, a flag and a printf; the reasoning is the part worth reading, and it
+// lives over release().
+// -----------------------------------------------------------------------------
+
+// This thread's nesting depth inside ANY PlainLogosObject entry point. Two
+// readers, both of them detector-side: it subtracts the caller's own frames from
+// the count reportConcurrentCallers reads, and it tells EntryGuard whether an
+// entry is a FRESH one from outside or a nested internal one, which is what keeps
+// the "entered after release" report off callMethodWithError ->
+// ensureCompletionSub -> onEvent.
+//
+// THE SHAPE IT EXISTS TO IGNORE: a thread that is inside a public method and,
+// from there, reaches teardown on the same object — a callback invoked from
+// within a call, releasing the handle it was called through. That is a
+// well-defined single-threaded sequence, not the race, and it is SAFE under the
+// reference count (the outer call holds a reference, so release() cannot destroy
+// the object underneath it and the guard does it on the way out). Reporting it
+// would be a false alarm. No path in this file invokes user code from inside a
+// guarded method today, so this is guarding a shape that does not yet exist —
+// which is exactly when it is cheap to guard.
+//
+// It counts entries into ANY object rather than into a particular one, because
+// a per-object thread-local is a map lookup on every call and the difference
+// only matters for a thread that is inside object A while releasing object B.
+// That case is not the defect, and the bias it introduces is the safe one:
+// this can only ever make the detector MISS a real race, never invent one.
+// Internal linkage: nothing outside this file may read it, and it must not
+// become an exported thread-local in the shared build.
+static thread_local int t_entryDepth = 0;
+
+// THE REFERENCE IS THE FIRST AND THE LAST THING EITHER OF THESE TOUCHES, and
+// that ordering is the whole safety argument.
+//
+// ON THE WAY IN the reference must be taken before any other access to the
+// object, because everything after it is what the reference protects. On the way
+// out it must be dropped after every other access, because dropping it may
+// DESTROY the object — this guard is the thing that performs the final `delete`
+// when it is the last one out, and any bookkeeping after that point would be a
+// store into freed memory. The earlier, detector-only version of this guard
+// learned that the hard way: it restored m_lastEntryPoint after decrementing,
+// which opened a window exactly one store wide for a concurrent release() to
+// `delete this` in, and that segfaulted a Linux CI run in an existing test whose
+// io-thread event callback releases the handle (IoFoldTest
+// .ReleaseFromInsideAnIoThreadEventCallbackDoesNotWedge).
+//
+// So: reference first, reference last, everything else in between.
+//
+// THE RESIDUAL INSTANT is the increment itself, and it is the boundary of what
+// this mechanism can do. A caller whose increment lands after release() has
+// already dropped the owner's reference and freed the storage is incrementing an
+// integer inside a dead object; nothing can be read out of freed memory to
+// prevent that, which is why entering after release() stays a caller error
+// rather than becoming safe. A call that entered BEFORE release() was called has
+// no such problem: its increment is ordered before release()'s decrement in the
+// modification order of m_liveRefs, so release() sees it, declines to destroy
+// and leaves the destruction to this guard.
+//
+// The cost of handing the diagnostic name back before the decrement is a
+// slightly vaguer message: a concurrent reader can see the OUTER frame's name
+// rather than the inner one. That is a diagnostic string; correctness of the
+// count is what matters.
+PlainLogosObject::EntryGuard::EntryGuard(PlainLogosObject* obj,
+                                         const char* entryPoint)
+    : m_obj(obj)
+    , m_prev(nullptr)
+{
+    ++t_entryDepth;                                        // thread-local
+    m_obj->m_liveRefs.fetch_add(1, std::memory_order_acq_rel);        // FIRST
+    m_obj->m_callsInFlight.fetch_add(1, std::memory_order_acq_rel);
+    m_prev = m_obj->m_lastEntryPoint.exchange(entryPoint,
+                                              std::memory_order_relaxed);
+    // A FRESH entry — not a nested one — into an object whose owner has already
+    // released it. Safe only because somebody else's reference is still holding
+    // the storage alive, which is luck and not a contract, so it is named.
+    //
+    // The depth test excludes the internal nested paths (callMethodWithError ->
+    // ensureCompletionSub -> onEvent), whose outer frame entered long before
+    // release() and which are not a second user of the handle. It is DEFENSIVE
+    // rather than load-bearing today: removing it leaves the whole suite green,
+    // because no nested entry currently happens after teardown has started —
+    // ensureCompletionSub runs before the call parks, not after it wakes. It is
+    // kept because that is a property of today's call paths and not of this
+    // check, and a false alarm here aborts a correct program.
+    if (t_entryDepth == 1 && m_obj->m_released.load(std::memory_order_acquire))
+        m_obj->reportEntryAfterRelease(entryPoint);
+}
+
+PlainLogosObject::EntryGuard::~EntryGuard()
+{
+    // Hand the name back first, so a nested entry does not leave the diagnostic
+    // blaming onEvent() for a caller that is really parked in
+    // callMethodWithError(). Across threads this is last-writer-wins and
+    // therefore approximate — it names ONE of the callers in flight, which is
+    // all the message claims.
+    m_obj->m_lastEntryPoint.store(m_prev, std::memory_order_relaxed);
+    --t_entryDepth;                                        // thread-local
+    m_obj->m_callsInFlight.fetch_sub(1, std::memory_order_acq_rel);
+    // LAST, and it may be a `delete`. Read into a local first: after the
+    // fetch_sub this guard may no longer have an object to name, and after the
+    // delete it must touch nothing at all — which is why this is the final
+    // statement of the final destructor of every entry point. EntryGuard is
+    // declared FIRST in each of them, so it is destroyed last, after every other
+    // local and after the return value has been constructed in the caller's
+    // storage.
+    PlainLogosObject* obj = m_obj;
+    if (obj->m_liveRefs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        delete obj;                    // the last one out turns the lights off
+}
+
+void PlainLogosObject::reportConcurrentCallers(const char* where) const
+{
+    // `- t_entryDepth` removes this thread's own frames; see t_entryDepth.
+    const int others =
+        m_callsInFlight.load(std::memory_order_acquire) - t_entryDepth;
+    if (others <= 0) return;
+
+    const char* entry = m_lastEntryPoint.load(std::memory_order_relaxed);
+
+    // Written straight to stderr, not through qWarning/qCritical, on purpose.
+    // By the time this fires the program has already committed the error and
+    // may be one instruction from a SIGSEGV, so the message must not depend on
+    // a Qt message handler being installed, being reachable, or flushing — and
+    // must not depend on a QCoreApplication existing at all, which on this
+    // transport it may not.
+    std::fprintf(stderr,
+        "\nLOGOS FATAL: PlainLogosObject::%s on '%s' ran while %d call(s) from "
+        "other threads are still inside this object (most recent entry: "
+        "PlainLogosObject::%s).\n"
+        "  This path destroys the object NOW, so those calls are about to use "
+        "freed memory. release() would have been safe — it drops the owner's "
+        "reference and lets the LAST call in flight do the destroying — but a "
+        "direct `delete` has nobody to hand the destruction to. Use release(), "
+        "or wait for the calls.\n"
+        "  This is a diagnostic, not a rescue: the object is destroyed either "
+        "way. See the note over PlainLogosObject::release().\n",
+        where, m_objectName.c_str(), others,
+        entry ? entry : "<unknown>");
+    std::fflush(stderr);
+
+    // Debug builds stop here, so the misuse is a named abort at the line that
+    // committed it rather than a SIGSEGV somewhere else. Release builds carry
+    // on into the same crash they would have had, with a log line naming the
+    // cause — the point being that turning a shipped app's latent misuse into a
+    // hard abort is not a decision a bug-fix release gets to make for its
+    // consumers.
+#ifndef NDEBUG
+    std::abort();
+#endif
+}
+
+// The other half of the diagnostic: not "teardown found a caller inside", but "a
+// caller came in after teardown". Reachable only while somebody else's reference
+// is still holding the storage alive — if it were not, this function would be
+// running on freed memory and there would be nothing to report with. That is
+// exactly why the message says the program is out of contract even though it did
+// not crash this time.
+void PlainLogosObject::reportEntryAfterRelease(const char* entryPoint) const
+{
+    std::fprintf(stderr,
+        "\nLOGOS FATAL: PlainLogosObject::%s was entered on '%s' AFTER "
+        "release() was called on the same handle.\n"
+        "  release() means the handle is finished: it is only still readable "
+        "because another call in flight is holding the object alive, and with "
+        "that call gone this would have been a use-after-free instead of a "
+        "message. A LogosObject handle is safe to use from several threads at "
+        "once, and calls already inside it are safe against release() — but "
+        "STARTING a call after release() is never safe.\n"
+        "  See the note over PlainLogosObject::release().\n",
+        entryPoint, m_objectName.c_str());
+    std::fflush(stderr);
+
+#ifndef NDEBUG
+    std::abort();
+#endif
+}
+
 PlainLogosObject::PlainLogosObject(std::string objectName,
                                    std::shared_ptr<RpcConnectionBase> conn)
     : m_objectName(std::move(objectName))
@@ -380,7 +747,24 @@ PlainLogosObject::PlainLogosObject(std::string objectName,
 
 PlainLogosObject::~PlainLogosObject()
 {
-    disconnectEvents();
+    // BEFORE anything is torn down, and it still has a job to do even now that
+    // release() is safe. Two ways to get here:
+    //
+    //   * through the reference count — release() dropped the owner's reference,
+    //     or the last call in flight dropped its own. Then no call is inside the
+    //     object by construction, the count is zero, and this returns silently.
+    //   * through `delete obj` on a handle somebody kept a second pointer to,
+    //     which bypasses the reference count entirely and destroys the object
+    //     while those calls are still running. Nothing here can defer THAT — the
+    //     caller has already demanded the storage back — so it is reported, and
+    //     aborts in a debug build, which is the whole reason this call survived
+    //     the change that made release() safe.
+    reportConcurrentCallers("~PlainLogosObject()");
+    // Impl, not the guarded entry point: taking an EntryGuard here would raise
+    // the reference count from zero and drop it again, and a drop to zero
+    // destroys the object — recursing into `delete this` from inside the
+    // destructor. Same reason in release().
+    disconnectEventsImpl();
     stopAndCancelCalls();
 }
 
@@ -449,6 +833,7 @@ QVariant PlainLogosObject::callMethodWithError(const QString& authToken,
                                                int timeoutMs,
                                                logos::CallError* err)
 {
+    EntryGuard guard(this, "callMethodWithError()");
     if (err) err->clear();
     if (!m_conn || !m_conn->isOpen()) {
         if (err)
@@ -643,11 +1028,12 @@ void PlainLogosObject::callMethodAsyncWithError(const QString& authToken,
                                                 int timeoutMs,
                                                 AsyncResultErrorCallback callback)
 {
+    EntryGuard guard(this, "callMethodAsyncWithError()");
     if (!callback) return;
     if (!m_conn || !m_conn->isOpen()) {
         // Defer even the failure path — LogosObject's contract requires
         // callbacks on a subsequent event-loop iteration, never inline.
-        postToQtEventLoop(std::move(callback), QVariant(),
+        postDelivery(std::move(callback), QVariant(),
                           logos::callErrorTransport(
                               m_objectName,
                               "connection to '" + m_objectName + "' is not open"));
@@ -793,6 +1179,7 @@ bool PlainLogosObject::informModuleToken(const QString& authToken,
                                          const QString& token,
                                          int /*timeoutMs*/)
 {
+    EntryGuard guard(this, "informModuleToken()");
     if (!m_conn || !m_conn->isOpen()) return false;
     TokenMessage msg;
     msg.authToken  = authToken.toStdString();
@@ -804,6 +1191,7 @@ bool PlainLogosObject::informModuleToken(const QString& authToken,
 
 void PlainLogosObject::onEvent(const QString& eventName, EventCallback callback)
 {
+    EntryGuard guard(this, "onEvent()");
     if (!m_conn || !m_conn->isOpen() || !callback) return;
 
     {
@@ -824,6 +1212,14 @@ void PlainLogosObject::onEvent(const QString& eventName, EventCallback callback)
 
 void PlainLogosObject::disconnectEvents()
 {
+    EntryGuard guard(this, "disconnectEvents()");
+    disconnectEventsImpl();
+}
+
+// The body, without the guard. See the declaration: release() and the destructor
+// must not take a reference to an object they are in the middle of destroying.
+void PlainLogosObject::disconnectEventsImpl()
+{
     std::vector<std::pair<QString, EventCallback>> subs;
     {
         std::lock_guard<std::mutex> g(m_mu);
@@ -840,6 +1236,7 @@ void PlainLogosObject::disconnectEvents()
 
 void PlainLogosObject::emitEvent(const QString& eventName, const QVariantList& data)
 {
+    EntryGuard guard(this, "emitEvent()");
     if (!m_conn || !m_conn->isOpen()) return;
     EventMessage msg;
     msg.object    = m_objectName;
@@ -850,6 +1247,7 @@ void PlainLogosObject::emitEvent(const QString& eventName, const QVariantList& d
 
 QJsonArray PlainLogosObject::getMethods()
 {
+    EntryGuard guard(this, "getMethods()");
     if (!m_conn || !m_conn->isOpen()) return QJsonArray();
 
     MethodsMessage msg;
@@ -888,10 +1286,85 @@ void PlainLogosObject::release()
     // running on the single io thread — the reentrant shape remote_transport.cpp
     // documents — which a "post a no-op onto the strand and wait for it" barrier
     // could not have been: it would have deadlocked against itself.
-    disconnectEvents();
+    //
+    // ── AND A CALL RUNNING ON ANOTHER THREAD RIGHT NOW ──────────────────────
+    //
+    // That used to be a use-after-free, and it is now safe. The defect was
+    // reproduced deterministically on master and on both pending PRs: a
+    // synchronous callMethod parked in its future wait, released from a second
+    // thread, faults on the very next line it executes
+    // (`m_conn->cancelPending(...)`), with and without Guard Malloc, because
+    // release() ended in an unconditional `delete this`.
+    //
+    // WHAT MAKES IT SAFE. The object carries a live-reference count (m_liveRefs,
+    // see EntryGuard above): 1 for the owner, plus one per caller currently
+    // inside a public entry point. release() does the teardown and then drops
+    // THE OWNER'S reference instead of deleting; whoever drops the count to zero
+    // does the delete. With a call in flight that is the call's own thread, on
+    // its way out, after its last access to the object.
+    //
+    // AND THE ARGUMENT THAT SAID THIS WAS IMPOSSIBLE, because it is instructive
+    // and it was wrong. It ran: any mechanism that could save the racing call has
+    // to be reached THROUGH `this`, so the racing thread's first act would be to
+    // read a freed object. True — for a call that ENTERS after destruction. It
+    // conflates that with a call ALREADY INSIDE the object, which is the defect
+    // actually reproduced: that call's reference was taken while the object was
+    // provably alive (it is what its own thread did on the way in, before
+    // release() was ever called), so its increment is ordered before release()'s
+    // decrement in the modification order of m_liveRefs, and release() therefore
+    // SEES it. Nothing is read through a dangling pointer anywhere in that
+    // sequence. The counter is a member, and that is fine, because the thread
+    // that has to trust the member is the thread that already published to it.
+    //
+    // WHAT IS STILL NOT SAFE, exactly:
+    //
+    //   * A CALL THAT ENTERS AT OR AFTER release(). Its very first act is to
+    //     increment a counter that may already be freed. This is the shape the
+    //     old argument describes correctly, it is what "the handle must not be
+    //     used after release()" has always meant, and it stays a caller error.
+    //     EntryGuard reports it (reportEntryAfterRelease) in the cases where the
+    //     object is still alive to notice — i.e. when another call in flight is
+    //     holding it — and in the cases where it is not, there is nothing left to
+    //     look at.
+    //   * `delete obj` INSTEAD OF release() with calls in flight. The caller has
+    //     demanded the storage back now, so there is no destruction left to
+    //     defer. The destructor reports it (reportConcurrentCallers) and aborts
+    //     in debug builds.
+    //   * TWO release()es ON THE SAME HANDLE. The second one is a call entering
+    //     after destruction, by the definition above.
+    //
+    // THE COSTS, since deferring a destruction is not free:
+    //
+    //   * release() still returns immediately, and still waits for nothing — the
+    //     property the two preceding changes exist to establish is untouched, and
+    //     the reentrant release()-from-an-io-thread-event-callback shape still
+    //     cannot deadlock, because nothing here blocks.
+    //   * The OBJECT, and with it its share of the connection, now lives until
+    //     the last call in flight leaves — bounded by that call's own timeout,
+    //     which the caller chose. A handle released while a 30-second call is
+    //     parked keeps ~200 bytes and one shared_ptr count alive for the rest of
+    //     that call. stopAndCancelCalls() has already cancelled everything it can
+    //     wake, so the only thing that can still take the full time is a
+    //     synchronous call parked in the connection's future, which nothing in
+    //     this transport can interrupt.
+    //   * m_conn IS NOT RESET HERE any more, and that is a correctness
+    //     requirement rather than a simplification: the parked caller's next act
+    //     is `m_conn->cancelPending(...)`, and resetting a shared_ptr while
+    //     another thread reads it is a data race on the shared_ptr itself. The
+    //     member is released by the destructor, which now runs when nobody is
+    //     inside the object.
+    m_released.store(true, std::memory_order_release);
+
+    // Impl, not the guarded entry point: an EntryGuard here would take a
+    // reference and drop it again, and it would ALSO trip the "entered after
+    // release" report it just armed. Same reason in the destructor.
+    disconnectEventsImpl();
     stopAndCancelCalls();
-    m_conn.reset();
-    delete this;
+    // THE LAST THING THIS FUNCTION TOUCHES, exactly as in EntryGuard: after the
+    // decrement this object may belong to another thread, and if the decrement
+    // reached zero it does not exist. Nothing below it, ever.
+    if (m_liveRefs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        delete this;
 }
 
 quintptr PlainLogosObject::id() const

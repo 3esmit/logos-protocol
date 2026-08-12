@@ -70,6 +70,37 @@ public:
     void disconnectEvents() override;
     void emitEvent(const QString& eventName, const QVariantList& data) override;
     QJsonArray getMethods() override;
+
+    // RELEASE() IS SAFE AGAINST CALLS THAT ARE ALREADY RUNNING, and the line
+    // between that and what is still a caller error is worth stating exactly.
+    //
+    // release() used to end in an unconditional `delete this`, so a call another
+    // thread was executing at that moment went on to touch freed members — a
+    // synchronous callMethod parked in its wait, released from a second thread,
+    // faults on the very next line it runs. That is fixed, not merely
+    // documented: this object carries a LIVE-REFERENCE COUNT. Every entry into a
+    // public method takes a reference before it touches anything else and drops
+    // it after everything else, release() drops the owner's reference instead of
+    // deleting, and whoever drops the LAST one destroys the object. So the
+    // destruction is DEFERRED to the moment the last in-flight call leaves — on
+    // that call's thread, not the releasing one — and release() itself still
+    // waits for nothing.
+    //
+    //   SAFE:      release() concurrent with any call that had ENTERED before
+    //              release() was called, sync or async, from any number of
+    //              threads. Also release() re-entered from inside a call or an
+    //              event callback on the same thread, which is shipped
+    //              behaviour.
+    //   STILL A    a call that ENTERS at or after release() (the object may
+    //   CALLER     already be gone, and a reference cannot be taken out of freed
+    //   ERROR:     storage), and `delete obj` instead of release() while a call
+    //              is in flight (the caller has demanded destruction NOW).
+    //
+    // Both remaining shapes are reported, and abort in debug builds, whenever
+    // the object still exists to notice — which for an entry after release() is
+    // whenever some other call is holding it alive. When the storage is already
+    // freed, nothing inside the object can see it; that residue is the contract
+    // documented on LogosObject::release() and cannot be closed from here.
     void release() override;
     quintptr id() const override;
 
@@ -166,6 +197,74 @@ private:
     QVariant awaitCompletion(const QString& callId, int timeoutMs,
                              const QString& methodName = QString(),
                              logos::CallError* err = nullptr);
+
+    // ── the live-reference count, and the detector beside it ────────────────
+    //
+    // m_liveRefs is the MECHANISM: 1 for the owner's reference — the one
+    // release() drops — plus one per caller currently inside a public entry
+    // point. Whoever drops it to zero destroys the object. That is what makes
+    // release() safe against a call already running (see release()), and it is
+    // reached only through EntryGuard and release(), never read to make a
+    // decision anywhere else.
+    //
+    // m_callsInFlight and m_lastEntryPoint are the DETECTOR, and they are NOT
+    // the same thing as the count above even though they move together. They
+    // answer "is somebody else inside this object right now, and where did they
+    // come in", for the two moments where that means the calling program is
+    // wrong in a way the reference count cannot repair: `delete obj` while a
+    // call is in flight, and a call entering after release(). A separate counter
+    // rather than a reading of m_liveRefs because the two differ in exactly the
+    // cases that matter — during destruction m_liveRefs is zero by construction,
+    // and the diagnostic still has to say how many callers were inside.
+    //
+    // The detector is deliberately biased to UNDER-report and never to
+    // false-alarm; see reportConcurrentCallers() for the shape it deliberately
+    // ignores. A detector that can fire on a correct program is worse than no
+    // detector.
+    //
+    // All three members are present in every build, NDEBUG or not, so this class
+    // has one layout everywhere: this header ships in the source export and is
+    // compiled into consumers whose optimisation settings are not ours to
+    // choose. Only the ABORT is conditional.
+    std::atomic<int>         m_liveRefs{1};
+    std::atomic<int>         m_callsInFlight{0};
+    std::atomic<const char*> m_lastEntryPoint{nullptr};
+    // Raised by release() before it tears anything down, so a call ENTERING
+    // afterwards can be named instead of quietly running against a dead object.
+    // Never cleared.
+    std::atomic<bool>        m_released{false};
+
+    // One per public entry point. Takes a live reference on the way in and drops
+    // it — last of all — on the way out, so a call that has entered cannot be
+    // destroyed underneath itself. RAII so an early return, of which
+    // callMethodWithError has four, can neither leak a reference (the object
+    // would never be destroyed) nor drop one twice, and so a nested entry
+    // (callMethodWithError calls ensureCompletionSub, which calls onEvent) hands
+    // the diagnostic name back on the way out instead of leaving it pointing at
+    // the innermost frame that happened to run last.
+    class EntryGuard {
+    public:
+        EntryGuard(PlainLogosObject* obj, const char* entryPoint);
+        ~EntryGuard();
+        EntryGuard(const EntryGuard&) = delete;
+        EntryGuard& operator=(const EntryGuard&) = delete;
+    private:
+        PlainLogosObject* m_obj;
+        const char*       m_prev;
+    };
+
+    // Prints the diagnostic and, in a debug build, aborts. `where` names the
+    // teardown entry point that found the object busy.
+    void reportConcurrentCallers(const char* where) const;
+    // The other half: a call that entered after release(). Named for the entry
+    // point it came in through.
+    void reportEntryAfterRelease(const char* entryPoint) const;
+    // disconnectEvents() without the EntryGuard, for the two callers that must
+    // NOT take a reference: release() and the destructor. A guard taken during
+    // destruction would raise the count from zero and drop it again, and the
+    // drop-to-zero is what destroys the object — i.e. it would recurse into
+    // `delete this` from inside `delete this`.
+    void disconnectEventsImpl();
 
     // Raise the stop flag, then cancel every outstanding async call — each of
     // which delivers its callback, once, with callErrorReleased — and wake the
