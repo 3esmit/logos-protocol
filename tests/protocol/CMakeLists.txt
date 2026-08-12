@@ -1,5 +1,21 @@
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Test)
 
+# ── validating the detectors ────────────────────────────────────────────────
+#
+# A race assertion that has never been seen to fail is not evidence, so the race
+# tests in this directory are checked against the code they were written for:
+# copy the test file onto the pre-fix tree and run it there. For the completion
+# subscription that tree is `master` — it has both the racy ensureCompletionSub()
+# and the raw-`this` handler capture — and the numbers those runs produced are
+# recorded in the test files themselves.
+#
+# Deliberately no build flag, no environment probe and no second implementation
+# in the shipped source. An earlier draft carried both, and the cost is the same
+# either way: production code grows a path whose only purpose is to be wrong.
+# Running the real pre-fix code is also the stronger evidence, because it proves
+# the test catches the bug that actually existed rather than a hand-written
+# imitation of it.
+
 add_executable(protocol_tests
     test_main.cpp
     # New protocol-level tests
@@ -84,6 +100,21 @@ add_executable(protocol_tests
     # boundary at m_waiterMu and its non-registry page is guarded while a waiter
     # runs.
     test_plain_waiter_publish_is_last.cpp
+    # The OTHER thing release() leaves behind: the deferred-completion event
+    # subscription. Its handler captured raw `this` and lives in the
+    # RpcConnection, which is shared across every handle and outlives all of
+    # them. dispatchIncoming copies the handler out under its mutex and invokes
+    # it unlocked, so the unsubscribe release() sends cannot reach one already in
+    # flight on the io thread — and nothing joins that thread. Pins the handler
+    # not reaching the object at all.
+    test_plain_completion_sub_lifetime.cpp
+    # The ORDERING half of the same subscription. ensureCompletionSub() raised
+    # its flag under the rendezvous mutex and released the mutex before
+    # subscribing, so a concurrent first caller could put a Call on the wire
+    # ahead of the Subscribe frame; a "multi" provider then completed into a
+    # subscription the host had not registered and the completion was dropped.
+    # Costs a caller its whole timeout and leaves nothing behind — see the file.
+    test_plain_completion_sub_order.cpp
     # Component tests that moved here with their code (from logos-cpp-sdk)
     test_token_manager.cpp
     test_mock_store.cpp
