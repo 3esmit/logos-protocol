@@ -159,7 +159,7 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
         qWarning() << "LogosAPIClient: token for" << objectName
                    << "rejected by provider; re-exchanging and retrying once";
         m_token_manager->removeToken(tokenKey);
-        const QString fresh = mintAndCacheToken(objectName);
+        const QString fresh = mintAndCacheToken(objectName, timeout);
         if (!fresh.isEmpty())
             result = m_consumer->invokeRemoteMethod(fresh, objectName, methodName, args, timeout, err);
     }
@@ -199,14 +199,6 @@ QString LogosAPIClient::mintAndCacheToken(const QString& objectName, Timeout tim
             QVariantList() << m_origin_module << objectName << m_target_instance_id,
             timeout);
         token = result.toString();
-    } else {
-        token = QString::fromStdString(
-            m_capability_consumer->requestModule(capabilityToken.toStdString(),
-                                                 m_origin_module.toStdString(),
-                                                 objectName.toStdString()));
-    }
-    qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":"
-             << redactToken(token);
     } else {
         token = QString::fromStdString(
             m_capability_consumer->requestModule(capabilityToken.toStdString(),
