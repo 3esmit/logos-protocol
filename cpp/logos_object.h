@@ -17,6 +17,39 @@
  * Each transport (local/Qt Remote Objects/mock/JSON-RPC/...) provides its
  * own concrete subclass.  Callers interact exclusively through this
  * interface and never need to know the implementation type.
+ *
+ * THREAD SAFETY, precisely — the two halves are not the same answer.
+ *
+ *   * CALLS are safe to make from several threads at once. The transports
+ *     serialize what has to be serialized internally.
+ *
+ *   * release() IS NOT SAFE AGAINST A CONCURRENT CALL AT THIS LEVEL. release()
+ *     destroys the object, so a call still executing on another thread is left
+ *     dereferencing freed memory. Write callers as if that is always true: every
+ *     call on a handle must have RETURNED before release() is entered. The
+ *     common shape that trips it is a handle shared with a worker thread and
+ *     released on teardown without waiting for the worker. Wait for it.
+ *
+ *     WHAT EACH TRANSPORT ACTUALLY DOES, because the answer is no longer uniform
+ *     and the difference is not something a caller should rely on:
+ *
+ *       - PLAIN: safe. The object counts the callers inside it, release() drops
+ *         the owner's reference rather than deleting, and the LAST call to leave
+ *         destroys the object. A call that had entered before release() was
+ *         called therefore runs to completion against a live object. release()
+ *         itself still returns immediately and waits for nothing. Two shapes
+ *         remain caller errors even there — STARTING a call at or after
+ *         release() (its first act is to touch storage that may already be
+ *         freed), and `delete obj` in place of release() with a call in flight —
+ *         and both are reported, aborting in debug builds, whenever the object
+ *         still exists to notice. See plain_logos_object.cpp.
+ *       - QT REMOTE / QT LOCAL / MOCK: not safe. release() ends in `delete
+ *         this`, with no counting and no detector.
+ *
+ *     So the INTERFACE contract is the strict one above. A transport may be
+ *     kinder than the contract; code written against the contract is correct on
+ *     all of them, and code written against the plain transport's behaviour
+ *     breaks the day it is handed a QtRO handle.
  */
 class LogosObject {
 public:
@@ -40,8 +73,50 @@ public:
     /**
      * @brief Invoke a method asynchronously; result is delivered via callback.
      *
-     * Returns immediately. The callback is always invoked on a subsequent
-     * event-loop iteration, never synchronously inside this call.
+     * Returns immediately. The callback is invoked AT MOST ONCE — never twice,
+     * never synchronously inside this call, and never on a transport's IO
+     * thread. It is invoked EXACTLY once whenever it has somewhere to run, and
+     * the three cases where it does not are listed below rather than left to be
+     * discovered: an unconditional promise here would be a promise the code
+     * cannot keep.
+     *
+     * WHERE it runs, which is a property of the process and not of the call:
+     * when the process has a Qt event loop the callback is queued onto it and
+     * therefore lands on the Qt thread, which is what every Qt host sees. A
+     * transport that supports Qt-free hosts (the plain transport) delivers on
+     * its own dedicated delivery thread when the process has no QCoreApplication
+     * at all, rather than dropping the callback — which is what it used to do,
+     * making "exactly once" mean "never" in a Qt-free process. Callers that need
+     * their own thread affinity must hop themselves; callers in a Qt host see no
+     * change.
+     *
+     * WHERE IT IS NOT DELIVERED, exhaustively for the plain transport:
+     *
+     *   1. In a Qt process, after QCoreApplication has been destroyed. There is
+     *      nowhere left to deliver it that is worth the cost — running user code
+     *      on a side thread while the objects it closes over are being torn down
+     *      is a worse outcome than silence.
+     *   2. In a process that constructs a QCoreApplication and never RUNS its
+     *      event loop. The delivery is queued onto that loop, and a loop that
+     *      never turns never runs it. "Has a Qt event loop" means a loop that
+     *      actually spins; a QCoreApplication that is only constructed is not
+     *      one, and the callback waits forever.
+     *   3. In a process that had a QCoreApplication TRANSIENTLY and is Qt-free
+     *      afterwards: case 1's rule latches, so the rest of that process keeps
+     *      dropping. From inside the transport, "the app is gone because we are
+     *      shutting down" and "the app is gone because a helper's app object went
+     *      out of scope" are indistinguishable, and guessing wrong in the other
+     *      direction would start running user callbacks on a side thread during
+     *      every Qt host's teardown.
+     *
+     * A process with NO QCoreApplication in its life is not on that list, and
+     * that is deliberate: there the delivery holds for the whole life of the
+     * process, INCLUDING static destruction after main() has returned (the plain
+     * transport's delivery thread is never torn down, precisely so that a
+     * callback issued from a static destructor still lands). The one thing that
+     * can still cut it short is the process itself exiting before the delivery
+     * thread runs — an ordinary race with process termination, not a decision
+     * made here.
      *
      * @param authToken Authentication token for the operation
      * @param methodName Method to call on the underlying module
@@ -109,6 +184,21 @@ public:
      * After calling release() the object must not be used again.
      * Implementations that own the underlying resource (e.g. a
      * QRemoteObjectReplica) will delete it here.
+     *
+     * "Must not be used again" is about STARTING something new, and it is
+     * absolute: no call, no event subscription, no second release(), on any
+     * thread, ever.
+     *
+     * Calls that are ALREADY RUNNING when release() is entered are a separate
+     * question, and the answer is per-transport — see the thread-safety note on
+     * this class. Write callers to the strict rule (order release() after every
+     * call has returned); the plain transport happens to survive the race and
+     * the Qt ones do not.
+     *
+     * release() does not wait. On every transport it returns without blocking on
+     * in-flight work; on the plain transport that means the underlying object can
+     * outlive the release() call by as long as the slowest call still inside it
+     * takes to finish, which is bounded by that call's own timeout.
      */
     virtual void release() = 0;
 
@@ -183,10 +273,12 @@ public:
     /**
      * @brief callMethodAsync, whose callback carries the reason on failure.
      *
-     * Same delivery contract as LogosObject::callMethodAsync: the callback
-     * fires on a subsequent event-loop iteration, never synchronously, and
-     * exactly once. On success the error argument is a default-constructed
-     * (ok()) CallError.
+     * Same delivery contract as LogosObject::callMethodAsync, in full: the
+     * callback fires from a later stack, never synchronously, never on a
+     * transport IO thread, at most once — and exactly once except in the three
+     * process-level cases enumerated there, which include the Qt-teardown drop
+     * and do NOT include a process that has simply never had a QCoreApplication.
+     * On success the error argument is a default-constructed (ok()) CallError.
      */
     virtual void callMethodAsyncWithError(const QString& authToken,
                                           const QString& methodName,

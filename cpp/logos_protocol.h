@@ -69,6 +69,33 @@
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
 #define LOGOS_PROTOCOL_VERSION_STRING "0.3.0"
 
+/* ---------------------------------------------------------------------------
+ * Export marking.
+ *
+ * These lp_* functions are the stable C ABI the JS and Rust SDKs bind to, so
+ * they must appear in the export table of the shared build (liblogos_protocol
+ * .dll / .so). On Windows that is not automatic: CMake builds shared libraries
+ * with symbol export disabled unless symbols are marked explicitly or
+ * WINDOWS_EXPORT_ALL_SYMBOLS is set -- the cross-built DLL was measured with
+ * ZERO exports before this macro existed, so every FFI consumer would have
+ * failed to bind at load time.
+ *
+ * Marked explicitly rather than via WINDOWS_EXPORT_ALL_SYMBOLS so the ABI
+ * surface is the one we declare, not whatever happens to have external
+ * linkage. Mirrors logos_module_impl.h's LOGOS_MODULE_IMPL_EXPORT.
+ * ------------------------------------------------------------------------- */
+#if defined(_WIN32)
+#if defined(LOGOS_PROTOCOL_BUILDING_SHARED)
+#define LP_API __declspec(dllexport)
+#else
+/* Consumers get plain declarations: dllimport would force them to link the
+ * import library even when they use the static archive. */
+#define LP_API
+#endif
+#else
+#define LP_API __attribute__((visibility("default")))
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -88,18 +115,18 @@ extern "C" {
 
 /** Version string "MAJOR.MINOR.PATCH" of the linked logos-protocol.
  *  Returns a static string — do NOT free. */
-const char* lp_protocol_version(void);
+LP_API const char* lp_protocol_version(void);
 
 /** MAJOR component of the linked logos-protocol version. Equal majors are
  *  compatible; unequal majors are not. */
-int lp_protocol_abi_major(void);
+LP_API int lp_protocol_abi_major(void);
 
 /* ---------------------------------------------------------------------------
  * Memory
  * ------------------------------------------------------------------------- */
 
 /** Free a string returned by this library. Safe to call with NULL. */
-void lp_string_free(char* s);
+LP_API void lp_string_free(char* s);
 
 /* ---------------------------------------------------------------------------
  * Process-global mode / transport defaults
@@ -108,10 +135,10 @@ void lp_string_free(char* s);
 /** Set the process-wide communication mode: "remote" (IPC, default),
  *  "local" (in-process registry) or "mock" (in-memory, for tests).
  *  Returns LP_OK or LP_ERR_INVALID_ARG. */
-int lp_set_mode(const char* mode);
+LP_API int lp_set_mode(const char* mode);
 
 /** Current mode as "remote" | "local" | "mock". Static string — do not free. */
-const char* lp_get_mode(void);
+LP_API const char* lp_get_mode(void);
 
 /** Set the process-global default transport from a JSON object, e.g.
  *    {"protocol":"local"}
@@ -119,7 +146,7 @@ const char* lp_get_mode(void);
  *    {"protocol":"tcp_ssl","host":"...","port":6443,"codec":"cbor",
  *     "ca_file":"...","cert_file":"...","key_file":"...","verify_peer":true}
  *  Returns LP_OK or LP_ERR_INVALID_ARG on parse failure. */
-int lp_set_default_transport(const char* transport_json);
+LP_API int lp_set_default_transport(const char* transport_json);
 
 /* ---------------------------------------------------------------------------
  * Consumer: clients, invoke, subscribe
@@ -156,7 +183,7 @@ typedef void (*lp_event_cb)(const char* event_name, const char* data_json,
  *
  * Returns NULL on invalid arguments.
  */
-lp_client* lp_client_create(const char* target_module,
+LP_API lp_client* lp_client_create(const char* target_module,
                             const char* origin_module,
                             const char* target_transport_json,
                             const char* capability_transport_json);
@@ -182,7 +209,7 @@ lp_client* lp_client_create_instance(const char* target_module,
 
 /** Destroy a client. After this returns, no further callbacks fire for the
  *  client or its subscriptions. */
-void lp_client_destroy(lp_client* client);
+LP_API void lp_client_destroy(lp_client* client);
 
 /**
  * Call `method` on the client's target module, blocking until the result
@@ -199,7 +226,7 @@ void lp_client_destroy(lp_client* client);
  * LP_ERR_INTERNAL when the provider invocation fails. Both out-strings are
  * owned by the caller (lp_string_free).
  */
-int lp_invoke(lp_client* client,
+LP_API int lp_invoke(lp_client* client,
               const char* method,
               const char* args_json,
               int timeout_ms,
@@ -234,7 +261,7 @@ int lp_invoke(lp_client* client,
  * Argument/handle validation still fails synchronously with
  * LP_ERR_INVALID_ARG and `cb` is NOT called in that case.
  */
-int lp_invoke_async(lp_client* client,
+LP_API int lp_invoke_async(lp_client* client,
                     const char* method,
                     const char* args_json,
                     int timeout_ms,
@@ -244,21 +271,61 @@ int lp_invoke_async(lp_client* client,
 /**
  * Subscribe to `event_name` emitted by the client's target module.
  * `cb` fires once per event with the payload as a JSON array.
- * Returns NULL on failure (e.g. the target object cannot be acquired).
+ *
+ * The target module does NOT have to be reachable yet. This is the normal
+ * case, not an edge case: a module subscribes to its dependency during init(),
+ * and a ui_qml backend during onContextReady(), both of which run while the
+ * dependency's host has been spawned but has not called listen(). The
+ * subscription is held and armed when the module appears — including a
+ * mid-session package install — so a NULL return means the ARGUMENTS were
+ * refused, never "not there yet".
+ *
+ * What it does not promise: arming is not retroactive and no transport buffers,
+ * so an event the module emits in the window before the subscription arms
+ * reaches nobody. A module that fires a one-shot "ready" event synchronously
+ * inside its own init() can still be missed; if that event matters, expose a
+ * method the subscriber can call after subscribing.
+ *
+ * Returns NULL only for a null/empty client, event name or callback.
  */
-lp_subscription* lp_subscribe(lp_client* client,
+LP_API lp_subscription* lp_subscribe(lp_client* client,
                               const char* event_name,
                               lp_event_cb cb,
                               void* user_data);
 
-/** Cancel a subscription. After this returns the callback will not fire
- *  again (already-running invocations are allowed to finish first). */
-void lp_unsubscribe(lp_subscription* sub);
+/** Cancel a subscription. After this returns the callback will not fire again
+ *  (already-running invocations are allowed to finish first) — that part is
+ *  synchronous and unconditional.
+ *
+ *  The client also stops TRACKING it, so a subscription cancelled while still
+ *  waiting for its module leaves the retry machinery instead of being warned
+ *  about forever. That half is EVENTUAL, not immediate: it is posted to the
+ *  client's owner thread and takes effect on a later turn of that thread's
+ *  event loop. Doing it synchronously would mean blocking on the owner thread
+ *  while holding a lock that thread's delivery callback also takes — a
+ *  deadlock, and an outright hang once that event loop has stopped, which is
+ *  exactly when a language binding's subscription handle is dropped.
+ *
+ *  Consequence for callers: lp_pending_subscriptions() may still list a
+ *  just-cancelled subscription until the owner thread runs. If the client is
+ *  destroyed first the cancellation simply never runs, which is correct — the
+ *  registry died with it. */
+LP_API void lp_unsubscribe(lp_subscription* sub);
+
+/** Diagnostics: a JSON array of "<module>::<event>" for every subscription on
+ *  this client that has been accepted but has not armed yet — i.e. is waiting
+ *  for its module to appear. `[]` when everything is live.
+ *
+ *  Exists because the Qt consumer has had this visibility all along and the C
+ *  ABI had none, which is precisely why a subscription that silently never
+ *  armed was undetectable from Rust, Nim or a universal C++ module. Caller
+ *  frees via lp_string_free; NULL only for a null client. */
+LP_API char* lp_pending_subscriptions(lp_client* client);
 
 /** Introspect the target module's methods/events as a JSON array (the
  *  same shape `lm` prints). Caller frees via lp_string_free. NULL on
  *  failure. */
-char* lp_get_methods(lp_client* client);
+LP_API char* lp_get_methods(lp_client* client);
 
 /* ---------------------------------------------------------------------------
  * Tokens
@@ -266,14 +333,14 @@ char* lp_get_methods(lp_client* client);
 
 /** Get the stored token for `module_name`. Returns NULL when absent;
  *  caller frees via lp_string_free. */
-char* lp_token_get(const char* module_name);
+LP_API char* lp_token_get(const char* module_name);
 
 /** Store a token for `module_name`. */
-int lp_token_save(const char* module_name, const char* token);
+LP_API int lp_token_save(const char* module_name, const char* token);
 
 /** Deliver a module token to the client's target (the consumer-side
  *  `informModuleToken`). Returns LP_OK when the target accepted it. */
-int lp_inform_module_token(lp_client* client,
+LP_API int lp_inform_module_token(lp_client* client,
                            const char* auth_token,
                            const char* module_name,
                            const char* token);
@@ -299,18 +366,18 @@ typedef char* (*lp_getmethods_cb)(void* user_data);
 typedef int (*lp_token_cb)(const char* module_name, const char* token,
                            void* user_data);
 
-lp_provider* lp_provider_create(const char* module_name,
+LP_API lp_provider* lp_provider_create(const char* module_name,
                                 const char* transport_set_json);
-void lp_provider_destroy(lp_provider* provider);
-int lp_provider_register(lp_provider* provider,
+LP_API void lp_provider_destroy(lp_provider* provider);
+LP_API int lp_provider_register(lp_provider* provider,
                          lp_dispatch_cb dispatch,
                          lp_getmethods_cb get_methods,
                          lp_token_cb on_token,
                          void* user_data);
-int lp_provider_emit_event(lp_provider* provider,
+LP_API int lp_provider_emit_event(lp_provider* provider,
                            const char* event_name,
                            const char* data_json);
-int lp_provider_save_token(lp_provider* provider,
+LP_API int lp_provider_save_token(lp_provider* provider,
                            const char* module_name,
                            const char* token);
 

@@ -114,6 +114,13 @@ struct lp_client {
 
 struct lp_subscription {
     std::shared_ptr<CbGuard> guard;
+    // Enough to un-register from the consumer's pending registry on
+    // lp_unsubscribe. The client guard is what makes that safe: a subscription
+    // can outlive lp_client_destroy, and dereferencing `owner` then would be a
+    // use-after-free.
+    LogosAPIClient* owner = nullptr;
+    std::shared_ptr<CbGuard> ownerGuard;
+    quint64 id = 0;
 };
 
 struct lp_provider {
@@ -413,16 +420,30 @@ lp_subscription* lp_subscribe(lp_client* client,
     if (!client || !client->client || !event_name || !*event_name || !cb)
         return nullptr;
 
-    LogosObject* object = client->client->requestObject(client->target);
-    if (!object) return nullptr;
-
+    // Deliberately NOT requestObject() + onEvent().
+    //
+    // That pair asks "is the target module reachable at this instant?", and
+    // every caller that reaches here asks it at the worst possible instant: a
+    // module's init(), a UI backend's onContextReady(), a generated
+    // `dep.onSomething(...)` wrapper — all of which run while the dependency's
+    // host process has been spawned but has not called listen() yet. The old
+    // code returned nullptr there, the generated wrapper turned that into a
+    // `false` its documented example discards, and the subscription was never
+    // attempted again for the life of the process: method calls worked, events
+    // silently never arrived.
+    //
+    // onEventWhenAvailable() returns a handle that arms when the module shows
+    // up (including a mid-session install), warns once when it defers, logs
+    // when it arms, and says so loudly if it ever becomes impossible.
     auto* sub = new lp_subscription();
     sub->guard = std::make_shared<CbGuard>();
+    sub->owner = client->client;
+    sub->ownerGuard = client->guard;
 
     std::shared_ptr<CbGuard> subGuard = sub->guard;
     std::shared_ptr<CbGuard> clientGuard = client->guard;
-    client->client->onEvent(
-        object, QString::fromUtf8(event_name),
+    sub->id = client->client->onEventWhenAvailable(
+        client->target, QString::fromUtf8(event_name),
         [subGuard, clientGuard, cb, user_data](const QString& name,
                                                const QVariantList& data) {
             std::lock_guard<std::recursive_mutex> subLock(subGuard->mutex);
@@ -436,6 +457,23 @@ lp_subscription* lp_subscribe(lp_client* client,
             const QByteArray nameUtf8 = name.toUtf8();
             cb(nameUtf8.constData(), json.c_str(), user_data);
         });
+
+    if (!sub->id) {
+        // The consumer refused the arguments (empty object/event name, or a
+        // null callback). Returning the handle anyway would hand the caller
+        // something that can never fire, while the ABI documents NULL as the
+        // one signal that the arguments were refused — a silent dead
+        // subscription, which is the exact failure this whole change removes.
+        //
+        // Defensive, and not reachable today: the guard at the top of this
+        // function already rejects an empty event name and a null callback, and
+        // lp_client_create rejects an empty target, so the three inputs that
+        // make onEventWhenAvailable() return 0 cannot all arrive here. Hence no
+        // test drives it — the two contracts simply have to agree, and one of
+        // them changing is how they would stop agreeing.
+        delete sub;
+        return nullptr;
+    }
     return sub;
 }
 
@@ -449,7 +487,69 @@ void lp_unsubscribe(lp_subscription* sub)
         std::lock_guard<std::recursive_mutex> lock(sub->guard->mutex);
         sub->guard->alive = false;
     }
+    // Stop the consumer tracking it too. Without this an unsubscribed-while-
+    // pending subscription stays in the registry forever: it holds the retry
+    // timer up, keeps emitting the 3 s / 60 s "still not reachable" warnings
+    // about a subscription nobody wants, and shows up in the
+    // pendingEventSubscriptions() diagnostics this whole change relies on for
+    // its own credibility.
+    if (sub->id && sub->owner && sub->ownerGuard) {
+        // POSTED, and deliberately NOT under ownerGuard->mutex.
+        //
+        // cancelEventSubscription() marshals to the owner thread with a
+        // BLOCKING queued connection, and the delivery callback installed by
+        // lp_subscribe takes this very mutex ON that thread (ownerGuard and the
+        // callback's clientGuard are the same CbGuard). Taking it here and then
+        // waiting for the owner thread is a lock-order inversion that
+        // deadlocks; and it hangs outright once the owner's event loop has
+        // stopped, which is exactly when a Rust EventSubscription drops.
+        //
+        // Posting instead: the lambda runs ON the owner thread, so the marshal
+        // inside cancelEventSubscription() becomes a direct call, and taking
+        // the guard there cannot wait on anyone. Qt drops posted events for a
+        // destroyed QObject, so a client torn down before delivery simply means
+        // the cancel never runs — which is correct, since the registry died
+        // with it.
+        auto ownerGuard = sub->ownerGuard;
+        LogosAPIClient* owner = sub->owner;
+        const quint64 id = sub->id;
+        std::lock_guard<std::recursive_mutex> ownerLock(ownerGuard->mutex);
+        if (ownerGuard->alive) {
+            // The guard is held across the POST but not across the cancel.
+            // That distinction is the whole fix, and both halves are load-bearing:
+            //
+            //  - It must be HELD here, because QMetaObject::invokeMethod
+            //    dereferences `owner` (it reads object->thread()) before the
+            //    lambda can run, so an `alive` check inside the lambda is
+            //    unreachable — lp_client_destroy sets alive=false and deletes
+            //    the client synchronously, and this struct's own contract says
+            //    a subscription may outlive it. Checking inside was a
+            //    use-after-free.
+            //  - It must NOT be held across cancelEventSubscription(), which
+            //    marshals to the owner thread with a BLOCKING queued connection
+            //    while that thread's delivery callback takes this same mutex —
+            //    a lock-order inversion that deadlocks, and hangs outright once
+            //    that event loop has stopped.
+            //
+            // Posting never waits on the owner thread, so holding the mutex
+            // across it cannot invert. Only the blocking marshal had to move.
+            QMetaObject::invokeMethod(owner, [ownerGuard, owner, id]() {
+                std::lock_guard<std::recursive_mutex> lock(ownerGuard->mutex);
+                if (ownerGuard->alive)
+                    owner->cancelEventSubscription(id);
+            }, Qt::QueuedConnection);
+        }
+    }
     delete sub;
+}
+
+char* lp_pending_subscriptions(lp_client* client)
+{
+    if (!client || !client->client) return nullptr;
+    nlohmann::json out = nlohmann::json::array();
+    for (const QString& entry : client->client->pendingEventSubscriptions())
+        out.push_back(entry.toStdString());
+    return lpStrdup(out.dump());
 }
 
 /* ------------------------------------------------------------ introspect */

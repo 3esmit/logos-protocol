@@ -6,12 +6,15 @@
 #include <QVariant>
 #include <QVariantList>
 #include <QMap>
+#include <QStringList>
 #include <functional>
 #include <string>
 #include <vector>
 
 #include "logos_call_error.h"
 #include "logos_mode.h"
+#include "logos_shared_api.h"
+#include "logos_subscription_state.h"
 #include "logos_transport_config.h"
 #include <nlohmann/json.hpp>
 
@@ -36,8 +39,15 @@ QString scopedModuleTokenKey(const QString& moduleName,
  * 
  * This class serves as a facade over LogosAPIConsumer, providing a clean interface
  * for applications that need to call remote methods and handle events.
+ *
+ * LOGOS_SHARED_API for the same reason as TokenManager, plus one of its own:
+ * this is the object that reaches the shared TokenManager on the call path, and
+ * archives are pulled a whole OBJECT FILE at a time. If the consumer imports
+ * TokenManager but not LogosAPIClient, ld pulls logos_api_client.cpp.obj out of
+ * liblogos_protocol.a for the client, that object drags token_manager.cpp.obj
+ * back in with it, and the duplicate static reappears. See logos_shared_api.h.
  */
-class LogosAPIClient : public QObject
+class LOGOS_SHARED_API LogosAPIClient : public QObject
 {
     Q_OBJECT
 
@@ -268,8 +278,78 @@ public:
      * @param eventName The name of the event to listen for
      * @param callback Function to call when the event is triggered
      */
-    void onEvent(LogosObject* originObject, const QString& eventName, 
+    void onEvent(LogosObject* originObject, const QString& eventName,
                 std::function<void(const QString&, const QVariantList&)> callback);
+
+    /**
+     * @brief Subscribe to an event on a module that may not be reachable YET.
+     *
+     * The safe alternative to requestObject() + onEvent() for any caller that
+     * subscribes during startup — a UI plugin's Component.onCompleted, a
+     * module's initLogos(), a backend's onContextReady(). Never blocks; arms
+     * when the module appears, including a mid-session install; warns once on
+     * deferral and logs when it arms. See LogosAPIConsumer::onEventWhenAvailable
+     * for the full contract, the cost of waiting, and the (deliberate) lack of
+     * de-duplication.
+     *
+     * Adds no member state to this class — see the ABI note below; it forwards
+     * to the consumer that already exists.
+     *
+     * @return A non-zero id for cancelEventSubscription() /
+     *         eventSubscriptionState(), or 0 if the arguments were refused.
+     */
+    quint64 onEventWhenAvailable(const QString& objectName, const QString& eventName,
+                                 std::function<void(const QString&, const QVariantList&)> callback,
+                                 std::function<void(bool)> onArmed = {});
+
+    quint64 onEventWhenAvailable(const std::string& objectName, const std::string& eventName,
+                                 std::function<void(const std::string&, const QVariantList&)> callback,
+                                 std::function<void(bool)> onArmed = {})
+    {
+        return onEventWhenAvailable(QString::fromStdString(objectName),
+                                    QString::fromStdString(eventName),
+                                    [cb = std::move(callback)](const QString& name, const QVariantList& args) {
+                                        cb(name.toStdString(), args);
+                                    },
+                                    std::move(onArmed));
+    }
+
+    /**
+     * @brief Call `onReady` once, as soon as the module becomes acquirable.
+     *
+     * The call-path counterpart of onEventWhenAvailable(), for a caller that
+     * must invoke a method on a module which may still be starting: it neither
+     * fails fast (stranding a UI that will never retry) nor calls straight
+     * through into the transport's acquire timeout on the calling thread. Fires
+     * exactly once, is not re-armed on reconnect, and holds no subscription.
+     * See LogosAPIConsumer::whenObjectAvailable for the full contract.
+     *
+     * @return A non-zero id accepted by cancelEventSubscription(), or 0.
+     */
+    quint64 whenObjectAvailable(const QString& objectName,
+                                std::function<void(bool)> onReady);
+
+    /**
+     * @brief Stop tracking the subscription with this id.
+     *
+     * See LogosAPIConsumer::cancelEventSubscription — in particular that it
+     * stops the BOOKKEEPING (the retry timer, the watchdog, the reconnect
+     * re-arm set) and does not detach the callback from the shared handle.
+     */
+    bool cancelEventSubscription(quint64 subscriptionId);
+
+    /**
+     * @brief Whether a subscription id is still pending, armed, or forgotten.
+     *        For callers that keep their own de-duplication record and need to
+     *        check it rather than trust it.
+     */
+    LogosSubscriptionState eventSubscriptionState(quint64 subscriptionId) const;
+
+    /**
+     * @brief Diagnostics: "<object>::<event>" for every deferred subscription
+     *        that has not armed yet.
+     */
+    QStringList pendingEventSubscriptions() const;
 
     /**
      * @brief Emit an event on a LogosObject (for plugins that act as event sources)
@@ -324,7 +404,10 @@ private:
     // the first-exchange logic so both the initial fetch and the
     // rejection-driven re-exchange share one path. (Private method — no effect on
     // the ABI-sensitive data layout below.)
-    QString mintAndCacheToken(const QString& objectName);
+    // `timeout` is the CALLER's budget, and it bounds the handshake too. It has
+    // to: the exchange runs before the call on an un-tokened target, so a bound
+    // that skipped it would describe only the second half of the operation.
+    QString mintAndCacheToken(const QString& objectName, Timeout timeout);
 
     // Empty target instances retain the historical logical-object key.
     // Explicit instances receive independent token/cache identity.

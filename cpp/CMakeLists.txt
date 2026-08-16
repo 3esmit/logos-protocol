@@ -11,10 +11,23 @@ set(CMAKE_AUTOMOC ON)
 find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Core RemoteObjects)
 find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Core RemoteObjects)
 
-# Plain-C++ transport dependencies (no Qt). The `system` component is
-# required for boost::system::error_code (Boost.Asio); without it
-# Boost::system isn't an exported imported target on Boost 1.87+.
-find_package(Boost REQUIRED COMPONENTS system)
+# Plain-C++ transport dependencies (no Qt).
+#
+# Boost.System is header-only, but Boost 1.87 only EXPORTS the Boost::system
+# imported target when the component is requested -- hence the explicit
+# COMPONENTS below. Boost 1.89 then removed the compiled boost_system library
+# outright, so there is no boost_systemConfig.cmake at all and requesting it as
+# REQUIRED hard-fails ("Could not find a package configuration file provided by
+# boost_system"). Ask for it optionally and fall back to Boost::headers, which
+# carries the same header-only error_code either way.
+find_package(Boost REQUIRED)
+find_package(Boost QUIET OPTIONAL_COMPONENTS system)
+if(TARGET Boost::system)
+    set(LOGOS_BOOST_SYSTEM Boost::system)
+else()
+    set(LOGOS_BOOST_SYSTEM Boost::headers)
+endif()
+message(STATUS "Boost.System target: ${LOGOS_BOOST_SYSTEM} (Boost ${Boost_VERSION})")
 find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
@@ -22,6 +35,7 @@ set(PROTOCOL_SOURCES
     logos_protocol.h
     logos_module_impl.h
     logos_call_error.h
+    logos_shared_api.h
     logos_protocol.cpp
     logos_types.cpp
     logos_types.h
@@ -29,6 +43,7 @@ set(PROTOCOL_SOURCES
     logos_api_client.h
     logos_api_consumer.cpp
     logos_api_consumer.h
+    logos_subscription_state.h
     module_proxy.cpp
     module_proxy.h
     token_manager.cpp
@@ -100,14 +115,27 @@ add_library(logos_protocol STATIC ${PROTOCOL_SOURCES})
 # Link Qt + plain-C++ transport deps. Boost.Asio is header-only
 # *except* for `boost::system::error_code` (and friends), which lives
 # in libboost_system — see the matching note in logos-cpp-sdk.
+# Boost.Asio's IOCP backend calls the Winsock EXTENSION functions AcceptEx and
+# GetAcceptExSockaddrs, which live in mswsock rather than ws2_32. Without this
+# the plain TCP transport compiles cleanly and then fails at link with
+# "undefined reference to `AcceptEx'" out of
+# win_iocp_socket_service_base::start_accept_op. ws2_32 supplies core Winsock
+# and is listed explicitly rather than relied upon arriving via Qt::Network.
+if(WIN32)
+    set(LOGOS_PROTOCOL_PLATFORM_LIBS ws2_32 mswsock)
+else()
+    set(LOGOS_PROTOCOL_PLATFORM_LIBS "")
+endif()
+
 target_link_libraries(logos_protocol PUBLIC
     Qt${QT_VERSION_MAJOR}::Core
     Qt${QT_VERSION_MAJOR}::RemoteObjects
     Boost::headers
-    Boost::system
+    ${LOGOS_BOOST_SYSTEM}
     OpenSSL::SSL
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
+    ${LOGOS_PROTOCOL_PLATFORM_LIBS}
 )
 
 target_include_directories(logos_protocol PUBLIC
@@ -149,11 +177,16 @@ target_link_libraries(logos_protocol_shared PUBLIC
     Qt${QT_VERSION_MAJOR}::Core
     Qt${QT_VERSION_MAJOR}::RemoteObjects
     Boost::headers
-    Boost::system
+    ${LOGOS_BOOST_SYSTEM}
     OpenSSL::SSL
     OpenSSL::Crypto
     nlohmann_json::nlohmann_json
+    ${LOGOS_PROTOCOL_PLATFORM_LIBS}
 )
+
+# Only the SHARED build marks the lp_* C ABI dllexport; the static archive
+# leaves LP_API empty so consumers linking it need no import library.
+target_compile_definitions(logos_protocol_shared PRIVATE LOGOS_PROTOCOL_BUILDING_SHARED)
 
 target_include_directories(logos_protocol_shared PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
@@ -209,9 +242,16 @@ install(FILES
     logos_codec.h
     logos_call_error.h
     logos_rpc_status.h
+    # Windows single-provider marker. token_manager.h / logos_api_client.h /
+    # logos_types.h include it, and so does logos-qt-sdk's logos_api.h, so it
+    # has to ship even though nothing in this library's own sources needs it.
+    logos_shared_api.h
     logos_types.h
     logos_api_client.h
     logos_api_consumer.h
+    # Named by logos_api_client.h and logos_api_consumer.h alike; the client only
+    # forward-declares the consumer, so the enum cannot live in the consumer header.
+    logos_subscription_state.h
     module_proxy.h
     token_manager.h
     logos_mode.h
