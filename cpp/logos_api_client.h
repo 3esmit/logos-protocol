@@ -106,6 +106,14 @@ public:
      */
     LogosObject* requestObject(const QString& objectName, Timeout timeout = Timeout());
 
+    /**
+     * @brief Return an already cached object without acquiring a new replica.
+     *
+     * The returned handle is borrowed from the client's cache. This method
+     * never performs transport I/O and the caller must not release it.
+     */
+    LogosObject* cachedObject(const QString& objectName);
+
     bool isConnected() const;
     QString registryUrl() const;
     bool reconnect();

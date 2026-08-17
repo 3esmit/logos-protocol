@@ -636,6 +636,15 @@ LogosObject* LogosAPIConsumer::requestObject(const QString& objectName, Timeout 
     return object;
 }
 
+LogosObject* LogosAPIConsumer::cachedObject(const QString& objectName)
+{
+    if (objectName.isEmpty()) return nullptr;
+
+    LogosObject* object = m_objectCache.value(objectName, nullptr);
+    if (object && object->isValid()) return object;
+    return nullptr;
+}
+
 bool LogosAPIConsumer::isConnected() const
 {
     return m_transport->isConnected();

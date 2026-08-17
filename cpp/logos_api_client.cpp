@@ -109,6 +109,15 @@ LogosObject* LogosAPIClient::requestObject(const QString& objectName, Timeout ti
     });
 }
 
+LogosObject* LogosAPIClient::cachedObject(const QString& objectName)
+{
+    // The cached handle is owned by the consumer and must be inspected on its
+    // owner thread, just like requestObject().
+    return logos::runOnOwnerThread(this, [&]() -> LogosObject* {
+        return m_consumer->cachedObject(objectName);
+    });
+}
+
 bool LogosAPIClient::isConnected() const
 {
     return m_consumer->isConnected();
