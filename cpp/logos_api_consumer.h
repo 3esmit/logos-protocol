@@ -98,6 +98,14 @@ public:
     LogosObject* requestObject(const QString& objectName, Timeout timeout = Timeout());
 
     /**
+     * @brief Return an already cached object without acquiring a new replica.
+     *
+     * This is a borrowed handle for local event wiring. It never performs
+     * transport I/O and must not be released by the caller.
+     */
+    LogosObject* cachedObject(const QString& objectName);
+
+    /**
      * @brief Acquire `objectName` into the handle cache, waiting up to `timeoutMs`,
      *        and report whether it is now reachable.
      *
