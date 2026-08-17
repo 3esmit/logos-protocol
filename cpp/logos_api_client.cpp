@@ -266,8 +266,24 @@ void LogosAPIClient::invokeRemoteMethodAsync(const QString& objectName, const QS
                                               const QVariantList& args, AsyncResultErrorCallback callback,
                                               Timeout timeout)
 {
-    // Public entry: grant one retry for the rejection-driven re-exchange.
-    invokeRemoteMethodAsyncImpl(objectName, methodName, args, std::move(callback), timeout, /*retriesLeft=*/1);
+    if (!callback) return;
+
+    // Even a caller already on the owner thread must enter the implementation
+    // through the event loop. The implementation may acquire a remote replica,
+    // and QtRO's synchronous waitForSource() spins a nested event loop while it
+    // waits. Running that acquire inline can block the GUI thread before the
+    // remote peer has had a chance to answer.
+    QPointer<LogosAPIClient> self(this);
+    QMetaObject::invokeMethod(
+        this,
+        [self, objectName, methodName, args,
+         callback = std::move(callback), timeout]() mutable {
+            if (!self) return;
+            self->invokeRemoteMethodAsyncImpl(
+                objectName, methodName, args, std::move(callback), timeout,
+                /*retriesLeft=*/1);
+        },
+        Qt::QueuedConnection);
 }
 
 void LogosAPIClient::invokeRemoteMethodAsyncImpl(const QString& objectName, const QString& methodName,
