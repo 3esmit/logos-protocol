@@ -9,6 +9,7 @@
 #include "logos_transport_factory.h"
 #include <chrono>
 #include <thread>
+#include <atomic>
 #include <QDebug>
 #include <QUrl>
 #include <QMetaObject>
@@ -773,71 +774,152 @@ void LogosAPIConsumer::invokeRemoteMethodAsync(const QString& authToken, const Q
         return;
     }
 
-    // Reuse the cached handle, same as the sync path — repeated async calls to
-    // one object (e.g. a proxy forwarding asynchronously) no longer re-acquire a
-    // replica per call. The handle stays owned by m_objectCache; the callback
-    // must NOT release it (it is shared across in-flight calls and freed only on
-    // eviction/teardown, via release()'s deferred deleteLater).
-    LogosObject* plugin = acquireCachedObject(objectName, timeout.ms);
-    if (!plugin) {
-        qWarning() << "LogosAPIConsumer: Failed to acquire plugin/replica for object:" << objectName;
-        logos::CallError err;
-        err.code = "object_unavailable";
-        err.message = "failed to acquire remote object '"
-                      + objectName.toStdString()
-                      + "' (module not loaded, not published, or transport failure)";
-        err.origin = objectName.toStdString();
-        QTimer::singleShot(0, this, [callback, err]() { callback(QVariant(), err); });
-        return;
-    }
+    auto callbackState = std::make_shared<AsyncResultErrorCallback>(std::move(callback));
+    auto delivered = std::make_shared<std::atomic_bool>(false);
+    auto deliver = [callbackState, delivered](QVariant result,
+                                               const logos::CallError& err) {
+        if (delivered->exchange(true)) return;
+        if (*callbackState) (*callbackState)(std::move(result), err);
+    };
 
-    qDebug() << "[LogosObject] LogosAPIConsumer: async calling via LogosObject::callMethodAsync" << methodName;
-    // QPointer guards against use-after-free: if the consumer is destroyed
-    // before the transport callback fires, the callback is silently dropped and
-    // the handle is released by the destructor's clearObjectCache(), not here.
-    QPointer<LogosAPIConsumer> self(this);
+    auto invokeWithObject = [this, authToken, objectName, methodName, args,
+                             timeout, deliver](LogosObject* plugin) mutable {
+        if (!plugin) {
+            qWarning() << "LogosAPIConsumer: Failed to acquire plugin/replica for object:"
+                       << objectName;
+            logos::CallError err;
+            err.code = "object_unavailable";
+            err.message = "failed to acquire remote object '"
+                          + objectName.toStdString()
+                          + "' (module not loaded, not published, or transport failure)";
+            err.origin = objectName.toStdString();
+            QTimer::singleShot(0, this, [deliver, err]() mutable {
+                deliver(QVariant(), err);
+            });
+            return;
+        }
 
-    // Prefer the error channel when the transport implements it. The lambda
-    // below used to take only `QVariant result` and hand the caller a
-    // hard-coded empty logos::CallError — so once acquire had succeeded, every
-    // async outcome was reported as a success, whatever actually happened.
-    if (auto* channel = dynamic_cast<LogosObjectErrorChannel*>(plugin)) {
-        channel->callMethodAsyncWithError(authToken, methodName, args, timeout.ms,
-            [callback, self, objectName](QVariant result, const logos::CallError& err) {
-                if (!self)
-                    return;
+        qDebug() << "[LogosObject] LogosAPIConsumer: async calling via LogosObject::callMethodAsync" << methodName;
+        // QPointer guards against use-after-free: if the consumer is destroyed
+        // before the transport callback fires, the callback is silently dropped
+        // and the handle is released by clearObjectCache().
+        QPointer<LogosAPIConsumer> self(this);
+
+        // Prefer the error channel when the transport implements it. The lambda
+        // below used to take only `QVariant result` and hand the caller a
+        // hard-coded empty logos::CallError — so once acquire had succeeded,
+        // every async outcome was reported as a success, whatever happened.
+        if (auto* channel = dynamic_cast<LogosObjectErrorChannel*>(plugin)) {
+            channel->callMethodAsyncWithError(authToken, methodName, args, timeout.ms,
+                [deliver, self, objectName](QVariant result, const logos::CallError& err) {
+                    if (!self) return;
+                    QString providerMessage;
+                    if (err.ok()
+                        && logos::isProviderFailureSentinel(result, &providerMessage)) {
+                        logos::CallError providerError;
+                        providerError.code = "invoke_failed";
+                        providerError.message = providerMessage.toStdString();
+                        providerError.origin = objectName.toStdString();
+                        deliver(QVariant(), providerError);
+                        return;
+                    }
+                    deliver(std::move(result), err);
+                });
+            return;
+        }
+
+        // Transport without an error channel (the mock): unchanged behaviour —
+        // the value, and no diagnosis to give.
+        plugin->callMethodAsync(authToken, methodName, args, timeout.ms,
+            [deliver, self, objectName](QVariant result) {
+                if (!self) return;
                 QString providerMessage;
-                if (err.ok()
-                    && logos::isProviderFailureSentinel(result, &providerMessage)) {
-                    logos::CallError providerError;
-                    providerError.code = "invoke_failed";
-                    providerError.message = providerMessage.toStdString();
-                    providerError.origin = objectName.toStdString();
-                    callback(QVariant(), providerError);
+                if (logos::isProviderFailureSentinel(result, &providerMessage)) {
+                    logos::CallError err;
+                    err.code = "invoke_failed";
+                    err.message = providerMessage.toStdString();
+                    err.origin = objectName.toStdString();
+                    deliver(QVariant(), err);
                     return;
                 }
-                callback(std::move(result), err);
+                deliver(result, logos::CallError{});
             });
+    };
+
+    // Reuse a live cached handle, same as the sync path. The handle stays owned
+    // by m_objectCache; callbacks must not release it.
+    if (LogosObject* cached = m_objectCache.value(objectName, nullptr)) {
+        if (cached->isValid()) {
+            invokeWithObject(cached);
+            return;
+        }
+        cached->release();
+        m_objectCache.remove(objectName);
+    }
+
+    // Qt Remote Objects exposes a non-blocking acquire path. Use it for async
+    // calls so a missing or still-starting module never makes the owner thread
+    // sit in QRemoteObjectReplica::waitForSource(). Other transports retain the
+    // old immediate acquire path: their requestObject() implementations do not
+    // wait on a remote peer.
+    if (auto* async = dynamic_cast<LogosTransportAsyncAcquire*>(m_transport.get())) {
+        QPointer<LogosAPIConsumer> self(this);
+        QPointer<QTimer> deadline = new QTimer(this);
+        deadline->setSingleShot(true);
+        const int timeoutMs = timeout.ms > 0 ? timeout.ms : 0;
+        QObject::connect(deadline, &QTimer::timeout, this,
+            [self, deadline, deliver, objectName, timeoutMs]() mutable {
+                if (deadline) deadline->deleteLater();
+                if (!self) return;
+                deliver(QVariant(), logos::callErrorTimeout(
+                    objectName.toStdString(),
+                    "acquire",
+                    timeoutMs));
+            });
+
+        if (LogosObject* now = async->tryAcquireNow(objectName)) {
+            deadline->deleteLater();
+            m_objectCache.insert(objectName, now);
+            invokeWithObject(now);
+            return;
+        }
+
+        if (async->requestObjectWhenAvailable(objectName,
+            [self, deadline, objectName, deliver, delivered,
+             invokeWithObject = std::move(invokeWithObject)](LogosObject* plugin) mutable {
+                if (!self) {
+                    if (plugin) plugin->release();
+                    return;
+                }
+                if (delivered->load()) {
+                    if (plugin) plugin->release();
+                    return;
+                }
+                if (deadline) {
+                    deadline->stop();
+                    deadline->deleteLater();
+                }
+                if (!plugin) {
+                    deliver(QVariant(), logos::callErrorObjectUnavailable(
+                        objectName.toStdString(),
+                        "remote object '" + objectName.toStdString()
+                            + "' is unavailable"));
+                    return;
+                }
+                self->m_objectCache.insert(objectName, plugin);
+                invokeWithObject(plugin);
+            })) {
+            deadline->start(timeoutMs);
+            return;
+        }
+
+        deadline->deleteLater();
+        invokeWithObject(nullptr);
         return;
     }
 
-    // Transport without an error channel (the mock): unchanged behaviour —
-    // the value, and no diagnosis to give.
-    plugin->callMethodAsync(authToken, methodName, args, timeout.ms,
-        [callback, self, objectName](QVariant result) {
-            if (!self)
-                return;
-            QString providerMessage;
-            if (logos::isProviderFailureSentinel(result, &providerMessage)) {
-                logos::CallError err;
-                err.code = "invoke_failed";
-                err.message = providerMessage.toStdString();
-                err.origin = objectName.toStdString();
-                callback(QVariant(), err);
-                return;
-            }
-            callback(result, logos::CallError{});
-        });
+    // Transport without deferred acquire: its requestObject() is immediate.
+    invokeWithObject(acquireCachedObject(objectName, timeout.ms));
 }
 
 void LogosAPIConsumer::onEvent(LogosObject* originObject, const QString& eventName, std::function<void(const QString&, const QVariantList&)> callback)

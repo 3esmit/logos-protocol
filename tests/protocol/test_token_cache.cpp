@@ -309,3 +309,50 @@ TEST_F(TokenCacheTest, UnTokenedCallBoundsTheHandshakeByTheCallersBudget)
            "LogosAPIConsumer::requestModule, which is ~40s of blocking in front "
            "of a bound the caller believed was 1500ms.";
 }
+
+// Async calls must not acquire a QtRO replica through the synchronous
+// requestObject() path. The target registry exists, but the requested object
+// is not published, so the old implementation blocks in waitForSource() for
+// the call timeout before returning to its caller.
+TEST_F(TokenCacheTest, AsyncCallDoesNotBlockWhileAcquiringRemoteObject)
+{
+    RemoteTransportHost targetHost(LogosInstance::id("target_module"));
+    PingProvider targetProvider;
+    ModuleProxy targetProxy(&targetProvider);
+    targetProvider.bindProxy(&targetProxy);
+    ASSERT_TRUE(targetHost.publishObject("other_module", &targetProxy));
+
+    RemoteTransportHost capHost(LogosInstance::id("capability_module"));
+    CapabilityProvider capProvider;
+    ModuleProxy capProxy(&capProvider);
+
+    const QString bootstrapToken = QStringLiteral("bootstrap-tok-async-acquire");
+    TokenManager::instance().saveToken(QStringLiteral("capability_module"), bootstrapToken);
+    ASSERT_TRUE(capProxy.saveToken(QStringLiteral("test_origin"), bootstrapToken));
+    ASSERT_TRUE(capHost.publishObject("capability_module", &capProxy));
+
+    LogosAPIClient client(QStringLiteral("target_module"),
+                          QStringLiteral("test_origin"),
+                          &TokenManager::instance());
+
+    for (int i = 0; i < 100 && !client.isConnected(); ++i) pumpEventLoop(20);
+    ASSERT_TRUE(client.isConnected());
+
+    std::atomic<int> completed{0};
+    QElapsedTimer timer;
+    timer.start();
+    client.invokeRemoteMethodAsync(
+        QStringLiteral("missing_async_object"),
+        QStringLiteral("ping"),
+        QVariantList{},
+        [&completed](QVariant) { completed.fetch_add(1); },
+        Timeout(250));
+
+    EXPECT_LT(timer.elapsed(), 100)
+        << "async replica acquisition blocked the caller for " << timer.elapsed()
+        << "ms";
+
+    for (int i = 0; i < 100 && completed.load() == 0; ++i)
+        pumpEventLoop(10);
+    EXPECT_EQ(completed.load(), 1);
+}
