@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <set>
 
 #include <boost/asio/post.hpp>
 #include <boost/asio/ssl/context.hpp>
@@ -349,16 +350,28 @@ void PlainTransportHost::unpublishObject(const QString& name)
 
 void PlainTransportHost::fanOutEvent(const std::string& name, EventMessage msg)
 {
+    // ONE COPY PER CONNECTION, not one per matching sink. A connection subscribed
+    // BOTH to an event by name and to the wildcard matches twice here, and every
+    // sink for a given connection does the same thing (write this frame back down
+    // that socket), so pushing both put the SAME event on the wire twice and the
+    // consumer delivered it twice to each of its subscribers. Measured before this
+    // guard: 5 emissions arriving as 10 deliveries at both a named and a wildcard
+    // subscriber. Keying the collection by connection is what makes event delivery
+    // exactly-once; the consumer decides which of its own handles a delivery goes
+    // to (RpcConnection::sendSubscribe).
     std::vector<EventSink> sinks;
     {
         std::lock_guard<std::mutex> g(m_mu);
-        auto it = m_published.find(name);
-        if (it == m_published.end()) return;
+        auto it = m_sinks.find(name);
+        if (it == m_sinks.end()) return;
+        std::set<const void*> seen;
         // Named subscribers + wildcard ("") subscribers get the event.
         for (auto which : {msg.eventName, std::string{}}) {
-            auto evtIt = it->second.sinksByEvent.find(which);
-            if (evtIt == it->second.sinksByEvent.end()) continue;
-            for (auto& [key, sink] : evtIt->second) sinks.push_back(sink);
+            auto evtIt = it->second.find(which);
+            if (evtIt == it->second.end()) continue;
+            for (auto& [key, sink] : evtIt->second)
+                if (seen.insert(key).second) sinks.push_back(sink);
+            if (msg.eventName.empty()) break;  // named IS wildcard here
         }
     }
     for (auto& sink : sinks) {
@@ -450,29 +463,36 @@ void PlainTransportHost::onSubscribe(const SubscribeMessage& req, EventSink sink
                                      const void* connectionId)
 {
     std::lock_guard<std::mutex> g(m_mu);
-    auto it = m_published.find(req.object);
-    if (it == m_published.end()) return;
-    // Sinks are keyed by the originating connection so that
-    // onUnsubscribe / onConnectionClosed can remove only sinks
-    // belonging to that connection — sub/unsub frames don't carry a
-    // subscriber id on the wire.
-    it->second.sinksByEvent[req.eventName][connectionId] = std::move(sink);
+    // Recorded whether or not `req.object` is published YET. A consumer
+    // subscribes exactly when it most likely is not — the host is listening but
+    // the module has not published — and refusing here loses the subscription
+    // silently: the consumer's requestObject() already succeeded, so nothing
+    // upstream knows to retry. The sink simply waits for the object to appear,
+    // which is the same contract onEventWhenAvailable() offers a layer up.
+    //
+    // ASSIGNING over an existing sink for the same pair is correct and not a
+    // clobber: every sink this host builds for one connection is the identical
+    // "write it back down that socket", so a repeated Subscribe is an idempotent
+    // re-assertion (a consumer sends one per handle). The consumer owns the
+    // demultiplexing — see incoming_call_handler.h.
+    m_sinks[req.object][req.eventName][connectionId] = std::move(sink);
 }
 
 void PlainTransportHost::onUnsubscribe(const UnsubscribeMessage& req,
                                        const void* connectionId)
 {
     std::lock_guard<std::mutex> g(m_mu);
-    auto it = m_published.find(req.object);
-    if (it == m_published.end()) return;
-    auto evtIt = it->second.sinksByEvent.find(req.eventName);
-    if (evtIt == it->second.sinksByEvent.end()) return;
+    auto it = m_sinks.find(req.object);
+    if (it == m_sinks.end()) return;
+    auto evtIt = it->second.find(req.eventName);
+    if (evtIt == it->second.end()) return;
     // Only drop the requesting connection's sink — other clients
     // subscribed to the same (object, event) keep theirs. Previously
     // this erased the entire eventName entry, taking every other
     // subscriber down with it.
     evtIt->second.erase(connectionId);
-    if (evtIt->second.empty()) it->second.sinksByEvent.erase(evtIt);
+    if (evtIt->second.empty()) it->second.erase(evtIt);
+    if (it->second.empty()) m_sinks.erase(it);
 }
 
 void PlainTransportHost::onConnectionClosed(const void* connectionId)
@@ -482,12 +502,14 @@ void PlainTransportHost::onConnectionClosed(const void* connectionId)
     // entries belonging to the closed connection. Without this, a
     // crashing/disconnecting client (which never sends Unsubscribe)
     // leaves dead sinks in the table forever.
-    for (auto& [_name, pub] : m_published) {
-        for (auto evtIt = pub.sinksByEvent.begin(); evtIt != pub.sinksByEvent.end(); ) {
+    for (auto objIt = m_sinks.begin(); objIt != m_sinks.end(); ) {
+        for (auto evtIt = objIt->second.begin(); evtIt != objIt->second.end(); ) {
             evtIt->second.erase(connectionId);
-            if (evtIt->second.empty()) evtIt = pub.sinksByEvent.erase(evtIt);
+            if (evtIt->second.empty()) evtIt = objIt->second.erase(evtIt);
             else ++evtIt;
         }
+        if (objIt->second.empty()) objIt = m_sinks.erase(objIt);
+        else ++objIt;
     }
 }
 

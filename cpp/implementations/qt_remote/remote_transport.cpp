@@ -11,6 +11,7 @@
 #include <QEventLoop>
 #include <QDebug>
 #include <QUrl>
+#include <QLocalSocket>
 #include <QMetaObject>
 #include <QTime>
 #include <QJsonArray>
@@ -492,6 +493,109 @@ private:
     QString m_objectName;
 };
 
+// ── PendingAcquire ───────────────────────────────────────────────────────────
+
+namespace {
+
+// One outstanding non-blocking acquire.
+//
+// Acquiring a dynamic replica before the peer exists is legal and free:
+// QRemoteObjectNodePrivate::handleNewAcquire registers the replica in the
+// node's `replicas` map with no connection, and when the peer finally shows up
+// the ObjectList packet handler calls handleReplicaConnection for every waiting
+// replica, which drives the replica to Valid. There is no polling here — the
+// node's own 250 ms reconnect timer (onShouldReconnect) is running for this
+// endpoint regardless of whether anyone is waiting on it.
+//
+// Deletes itself after delivering exactly once. If it is destroyed before
+// delivering (transport torn down), it owns and deletes the replica.
+class PendingAcquire : public QObject {
+    Q_OBJECT
+public:
+    PendingAcquire(QRemoteObjectReplica* replica,
+                   const QString& objectName,
+                   LogosTransportAsyncAcquire::AcquireCallback cb,
+                   QObject* parent)
+        : QObject(parent)
+        , m_replica(replica)
+        , m_objectName(objectName)
+        , m_cb(std::move(cb))
+    {
+        connect(m_replica, &QRemoteObjectReplica::stateChanged,
+                this, &PendingAcquire::onStateChanged);
+        // Already live (module was up before we asked) — still deliver via the
+        // event loop, so the callback contract is "never synchronously".
+        if (m_replica->state() == QRemoteObjectReplica::Valid)
+            schedule(true);
+    }
+
+    ~PendingAcquire() override
+    {
+        // Only reached when we never handed the replica over.
+        delete m_replica;
+    }
+
+private slots:
+    void onStateChanged(QRemoteObjectReplica::State state,
+                        QRemoteObjectReplica::State /*old*/)
+    {
+        if (m_done) return;
+        if (state == QRemoteObjectReplica::Valid) {
+            schedule(true);
+        } else if (state == QRemoteObjectReplica::SignatureMismatch) {
+            // Terminal: handleReplicaConnection warns and never connects, and
+            // no further state change will arrive. Report it rather than
+            // sitting Pending forever in silence — a subscription that can
+            // never arm has to SAY so.
+            qWarning() << "RemoteTransportConnection: source signature mismatch for"
+                       << m_objectName << "-- this acquire can never succeed";
+            schedule(false);
+        }
+        // Suspect / Default are NOT terminal: the source can come back and the
+        // node will re-drive the replica to Valid.
+    }
+
+private:
+    void schedule(bool ok)
+    {
+        if (m_done) return;
+        m_done = true;
+        // NEVER deliver inline. stateChanged is emitted from inside
+        // QRemoteObjectNodePrivate::onClientRead; constructing a
+        // RemoteLogosObject (which connects to the same replica) and then
+        // running caller code there re-enters QtRO while the replica is still
+        // emitting. That is precisely the refresh_balances SIGSEGV documented
+        // on RemoteLogosObject::disconnectEvents(). Hop to the next event-loop
+        // turn; `this` as context cancels the call if we are destroyed first.
+        QTimer::singleShot(0, this, [this, ok]() { deliver(ok); });
+    }
+
+    void deliver(bool ok)
+    {
+        QRemoteObjectReplica* replica = m_replica;
+        m_replica = nullptr;                       // ownership leaves us either way
+        disconnect(replica, nullptr, this, nullptr);
+
+        LogosObject* obj = nullptr;
+        if (ok) {
+            g_acquireCount.fetch_add(1, std::memory_order_relaxed);
+            obj = new RemoteLogosObject(replica, m_objectName);
+        } else {
+            delete replica;
+        }
+        auto cb = std::move(m_cb);
+        deleteLater();
+        cb(obj);                                   // may re-enter the transport safely
+    }
+
+    QRemoteObjectReplica* m_replica;
+    QString m_objectName;
+    LogosTransportAsyncAcquire::AcquireCallback m_cb;
+    bool m_done = false;
+};
+
+} // anonymous namespace
+
 // ── RemoteTransportHost ──────────────────────────────────────────────────────
 
 RemoteTransportHost::RemoteTransportHost(const QString& registryUrl)
@@ -556,6 +660,7 @@ void RemoteTransportHost::unpublishObject(const QString& /*name*/)
 
 RemoteTransportConnection::RemoteTransportConnection(const QString& registryUrl)
     : m_node(new QRemoteObjectNode())
+    , m_pendingAcquires(new QObject())
     , m_registryUrl(registryUrl)
     , m_connected(false)
 {
@@ -563,6 +668,11 @@ RemoteTransportConnection::RemoteTransportConnection(const QString& registryUrl)
 
 RemoteTransportConnection::~RemoteTransportConnection()
 {
+    // Pending replicas and parked probes belong to the node; kill them FIRST so
+    // none outlives it.
+    m_probes.clear();
+    delete m_pendingAcquires;
+    m_pendingAcquires = nullptr;
     delete m_node;
 }
 
@@ -571,9 +681,44 @@ bool RemoteTransportConnection::connectToHost()
     return connectToRegistry();
 }
 
+bool RemoteTransportConnection::endpointHasListener() const
+{
+    const QUrl url(m_registryUrl);
+    // Only `local:` can be probed cheaply and without side effects worth
+    // worrying about. Anything else keeps the previous semantics.
+    if (url.scheme() != QLatin1String("local"))
+        return true;
+
+    const QString serverName = url.path().isEmpty() ? url.host() : url.path();
+    if (serverName.isEmpty())
+        return true;
+
+    // A client connect is exactly what QtRO itself does, so a transient one is
+    // benign against a live registry, and against a dead endpoint it fails
+    // immediately -- ERROR_FILE_NOT_FOUND on Windows, ENOENT/ECONNREFUSED on
+    // Unix. That is the whole point: cost is microseconds when the answer is
+    // "no", which is the case that currently costs 20 seconds.
+    QLocalSocket probe;
+    probe.connectToServer(serverName, QIODevice::ReadOnly);
+    const bool alive = probe.waitForConnected(250);
+    probe.abort();
+    return alive;
+}
+
 bool RemoteTransportConnection::isConnected() const
 {
-    return m_connected;
+    // m_connected alone is NOT an answer. QRemoteObjectNode::connectToNode()
+    // returns false only when the URL scheme is unregistered -- it never
+    // contacts the peer -- and our registry URLs are COMPUTED rather than
+    // discovered (logos_instance.h: local:logos_<module>_<instanceId>), so they
+    // are identical whether or not the module exists. Returning the raw latch
+    // made every `if (!client->isConnected()) return;` guard in the codebase
+    // dead code, and callers then paid a 20 s waitForSource per call against
+    // modules that were never loaded -- measured at ~417 s of blocked GUI
+    // thread in Basecamp on macOS, 361 s on Linux, before its window appeared.
+    if (!m_connected)
+        return false;
+    return endpointHasListener();
 }
 
 bool RemoteTransportConnection::reconnect()
@@ -581,6 +726,13 @@ bool RemoteTransportConnection::reconnect()
     qDebug() << "RemoteTransportConnection: Attempting to reconnect to registry:" << m_registryUrl;
 
     if (m_connected) {
+        // In-flight acquires hold replicas belonging to the node about to die.
+        // Drop them first; their callbacks are cancelled with them, so the
+        // consumer's subscription registry re-arms against the new node
+        // (LogosAPIConsumer::reconnect -> reconnected()).
+        m_probes.clear();
+        delete m_pendingAcquires;
+        m_pendingAcquires = new QObject();
         delete m_node;
         m_node = new QRemoteObjectNode();
         m_connected = false;
@@ -609,13 +761,17 @@ bool RemoteTransportConnection::connectToRegistry()
 
     if (success) {
         m_connected = true;
-        qDebug() << "RemoteTransportConnection: Successfully connected to registry:" << m_registryUrl;
+        // Deliberately NOT "Successfully connected". connectToNode() only
+        // accepted the URL scheme; it never contacted a peer, and this line
+        // previously asserted a connection that frequently did not exist. That
+        // false claim sent three separate investigations to the wrong place --
+        // it cost considerably more than the bug it hid.
+        qDebug() << "RemoteTransportConnection: Registry connect attempt started (no peer contact yet):"
+                 << m_registryUrl;
     } else {
         m_connected = false;
-        qWarning() << "RemoteTransportConnection: Failed to connect to registry:" << m_registryUrl;
+        qWarning() << "RemoteTransportConnection: Registry URL scheme rejected:" << m_registryUrl;
     }
-    qDebug() << "RemoteTransportConnection: Connected to registry at"
-             << QTime::currentTime().toString("hh:mm:ss.zzz");
 
     return m_connected;
 }
@@ -625,6 +781,15 @@ LogosObject* RemoteTransportConnection::requestObject(const QString& objectName,
     if (!m_connected) {
         qWarning() << "RemoteTransportConnection: Not connected. Cannot request object:" << objectName;
         return nullptr;
+    }
+
+    // Warn BEFORE a doomed wait rather than after it. Without this the log went
+    // silent for the full timeout and then reported failure, which reads as a
+    // hang with no cause attached.
+    if (!endpointHasListener()) {
+        qWarning() << "RemoteTransportConnection: no listener at" << m_registryUrl
+                   << "-- request for" << objectName << "will block up to" << timeoutMs
+                   << "ms and then fail. Is the module loaded?";
     }
 
     qDebug() << "RemoteTransportConnection: Requesting object:" << objectName
@@ -643,6 +808,81 @@ LogosObject* RemoteTransportConnection::requestObject(const QString& objectName,
     }
 
     qDebug() << "[LogosObject] RemoteTransportConnection: returning RemoteLogosObject for:" << objectName;
+    g_acquireCount.fetch_add(1, std::memory_order_relaxed);
+    return new RemoteLogosObject(replica, objectName);
+}
+
+bool RemoteTransportConnection::requestObjectWhenAvailable(const QString& objectName,
+                                                           AcquireCallback onReady)
+{
+    if (objectName.isEmpty() || !onReady) return false;
+    if (!m_node || !m_pendingAcquires) return false;
+    // m_connected is the raw "connectToNode() accepted the URL" latch, and here
+    // that is exactly the right question: we are NOT asking whether the peer is
+    // up (it deliberately need not be), only whether this node is wired to the
+    // endpoint so QtRO's reconnect loop is running for it. Calling the truthful
+    // isConnected() here would reintroduce the very bug this exists to fix.
+    if (!m_connected) return false;
+
+    QRemoteObjectReplica* replica = m_node->acquireDynamic(objectName);
+    if (!replica) {
+        qWarning() << "RemoteTransportConnection: Failed to acquire replica for:" << objectName;
+        return false;
+    }
+
+    new PendingAcquire(replica, objectName, std::move(onReady), m_pendingAcquires);
+    return true;
+}
+
+LogosObject* RemoteTransportConnection::tryAcquireNow(const QString& objectName)
+{
+    if (objectName.isEmpty() || !m_node) return nullptr;
+    // Raw latch, same reasoning as requestObjectWhenAvailable: the question is
+    // whether this node is wired to the endpoint, not whether the peer is up.
+    if (!m_connected) return nullptr;
+
+    // PARK the probe; never free it while it is unconfigured. QtRO shares one
+    // replica implementation per object name on a node, and while that
+    // implementation is still waiting for the source's metaobject it records
+    // every facade built on it as a RAW pointer in m_parentsNeedingConnect.
+    // ~QRemoteObjectReplica is an empty body, so destroying a facade does not
+    // deregister it — and the implementation dereferences the whole list when
+    // the class definition finally arrives.
+    //
+    // The earlier acquire-then-delete form was therefore a use-after-free that
+    // left one dangling pointer per probe. It survived a single subscription
+    // (the probe owned the only implementation and took it down with itself)
+    // and crashed once a second subscription shared an implementation pinned by
+    // an in-flight PendingAcquire: SIGBUS with BUS_ADRALN, in the consumer's
+    // event loop rather than at the call site.
+    //
+    // Parking costs one idle replica per name until it goes Valid or the
+    // connection dies. Parented to m_pendingAcquires, which both ~RemoteTransportConnection
+    // and reconnect() destroy BEFORE the node — the ordering is what makes
+    // freeing them safe, since the implementations die in the same breath.
+    QPointer<QRemoteObjectReplica>& probe = m_probes[objectName];
+    if (!probe) {
+        QRemoteObjectReplica* fresh = m_node->acquireDynamic(objectName);
+        if (!fresh) {
+            m_probes.remove(objectName);
+            return nullptr;
+        }
+        if (m_pendingAcquires) fresh->setParent(m_pendingAcquires);
+        probe = fresh;
+    }
+
+    // Not Valid means "would have to be waited on", and waiting is exactly what
+    // this must not do — requestObjectWhenAvailable owns that. Leave the probe
+    // parked and answer no.
+    if (probe->state() != QRemoteObjectReplica::Valid)
+        return nullptr;
+
+    // Valid: the implementation is configured, so it is no longer holding this
+    // facade in m_parentsNeedingConnect and handing ownership over is safe.
+    QRemoteObjectReplica* replica = probe;
+    m_probes.remove(objectName);
+    replica->setParent(nullptr);
+
     g_acquireCount.fetch_add(1, std::memory_order_relaxed);
     return new RemoteLogosObject(replica, objectName);
 }

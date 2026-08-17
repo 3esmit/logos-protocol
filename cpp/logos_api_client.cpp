@@ -145,7 +145,7 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
     const QString tokenKey = tokenKeyFor(objectName);
     QString token = getToken(objectName);
     if (token.isEmpty() && eligible)
-        token = mintAndCacheToken(objectName);   // first exchange (cached for later calls)
+        token = mintAndCacheToken(objectName, timeout);   // first exchange (cached for later calls)
 
     QVariant result = m_consumer->invokeRemoteMethod(token, objectName, methodName, args, timeout, err);
 
@@ -159,7 +159,7 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
         qWarning() << "LogosAPIClient: token for" << objectName
                    << "rejected by provider; re-exchanging and retrying once";
         m_token_manager->removeToken(tokenKey);
-        const QString fresh = mintAndCacheToken(objectName);
+        const QString fresh = mintAndCacheToken(objectName, timeout);
         if (!fresh.isEmpty())
             result = m_consumer->invokeRemoteMethod(fresh, objectName, methodName, args, timeout, err);
     }
@@ -180,7 +180,7 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
     });
 }
 
-QString LogosAPIClient::mintAndCacheToken(const QString& objectName)
+QString LogosAPIClient::mintAndCacheToken(const QString& objectName, Timeout timeout)
 {
     const QString tokenKey = tokenKeyFor(objectName);
     const bool scopedTarget = !m_target_instance_id.isEmpty()
@@ -197,13 +197,14 @@ QString LogosAPIClient::mintAndCacheToken(const QString& objectName)
             QStringLiteral("capability_module"),
             QStringLiteral("requestModuleScoped"),
             QVariantList() << m_origin_module << objectName << m_target_instance_id,
-            Timeout());
+            timeout);
         token = result.toString();
     } else {
         token = QString::fromStdString(
             m_capability_consumer->requestModule(capabilityToken.toStdString(),
                                                  m_origin_module.toStdString(),
-                                                 objectName.toStdString()));
+                                                 objectName.toStdString(),
+                                                 timeout.ms));
     }
     qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":"
              << redactToken(token);
@@ -439,6 +440,51 @@ void LogosAPIClient::onEvent(LogosObject* originObject, const QString& eventName
     // Marshal to the owner thread: event registration touches the replica.
     logos::runOnOwnerThread(this, [&]() {
         m_consumer->onEvent(originObject, eventName, std::move(callback));
+    });
+}
+
+quint64 LogosAPIClient::onEventWhenAvailable(const QString& objectName, const QString& eventName,
+                                             std::function<void(const QString&, const QVariantList&)> callback,
+                                             std::function<void(bool)> onArmed)
+{
+    // Marshal to the owner thread for the same reason onEvent() does: the
+    // registry touches (and later arms against) a QtRO replica, which only
+    // works on the thread that created the node.
+    return logos::runOnOwnerThread(this, [&]() -> quint64 {
+        return m_consumer->onEventWhenAvailable(objectName, eventName,
+                                                std::move(callback), std::move(onArmed));
+    });
+}
+
+quint64 LogosAPIClient::whenObjectAvailable(const QString& objectName,
+                                            std::function<void(bool)> onReady)
+{
+    // Same owner-thread marshalling as onEventWhenAvailable: the registry
+    // touches a QtRO node that only works on the thread that created it.
+    return logos::runOnOwnerThread(this, [&]() -> quint64 {
+        return m_consumer->whenObjectAvailable(objectName, std::move(onReady));
+    });
+}
+
+bool LogosAPIClient::cancelEventSubscription(quint64 subscriptionId)
+{
+    return logos::runOnOwnerThread(this, [&]() -> bool {
+        return m_consumer->cancelEventSubscription(subscriptionId);
+    });
+}
+
+LogosSubscriptionState LogosAPIClient::eventSubscriptionState(quint64 subscriptionId) const
+{
+    return logos::runOnOwnerThread(const_cast<LogosAPIClient*>(this),
+                                   [&]() -> LogosSubscriptionState {
+        return m_consumer->eventSubscriptionState(subscriptionId);
+    });
+}
+
+QStringList LogosAPIClient::pendingEventSubscriptions() const
+{
+    return logos::runOnOwnerThread(const_cast<LogosAPIClient*>(this), [&]() -> QStringList {
+        return m_consumer->pendingSubscriptions();
     });
 }
 
