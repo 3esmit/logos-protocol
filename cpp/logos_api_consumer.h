@@ -81,9 +81,6 @@ public:
                               TokenManager* token_manager,
                               QObject *parent = nullptr);
 
-    // Convenience instance-aware variant using the process-global transport
-    // configuration. It preserves the name-only constructor when the supplied
-    // instance ID is empty.
     LogosAPIConsumer(const QString& module_to_talk_to,
                      const QString& origin_module,
                      TokenManager* token_manager,
@@ -128,10 +125,11 @@ public:
      * @brief invokeRemoteMethod with an explicit error out-channel.
      *
      * Fills *err with the canonical {code, message, origin} call error when
-     * the failure is detectable on this side: "object_unavailable" when the
-     * target object/replica cannot be acquired, or "invoke_failed" when the
-     * target provider throws. On success *err is cleared. Failures the
-     * transport cannot yet distinguish from a void result leave *err clear.
+     * the failure is detectable on this side (today: "object_unavailable"
+     * when the target object/replica cannot be acquired). On success *err is
+     * cleared. Failures the transport cannot yet distinguish from a void
+     * result (per-dispatch errors) leave *err clear — the struct is the
+     * extension point for surfacing transport-level statuses later.
      */
     QVariant invokeRemoteMethod(const QString& authToken, const QString& objectName, const QString& methodName,
                              const QVariantList& args, Timeout timeout, logos::CallError* err);
@@ -166,11 +164,10 @@ public:
     /**
      * @brief invokeRemoteMethodAsync with an explicit error out-channel.
      *
-     * Sets the CallError to code="object_unavailable" when acquire fails or
-     * code="invoke_failed" when the target provider throws (matching the sync
-     * overload's semantics — see logos_call_error.h), cleared on success.
-     * Callers that need to react differently from "call returned no value"
-     * should use this overload.
+     * Sets the CallError to code="object_unavailable" when acquire fails
+     * (matching the sync overload's semantics — see logos_call_error.h),
+     * cleared on success. Callers that need to react to acquire failure
+     * differently from "call returned no value" should use this overload.
      */
     void invokeRemoteMethodAsync(const QString& authToken, const QString& objectName, const QString& methodName,
                                  const QVariantList& args,

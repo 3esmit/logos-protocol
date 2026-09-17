@@ -294,8 +294,7 @@ QString LogosAPIClient::mintAndCacheToken(const QString& objectName, Timeout tim
                                                  m_origin_module.toStdString(),
                                                  objectName.toStdString(), timeout.ms));
     }
-    qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":"
-             << redactToken(token);
+    qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":" << redactToken(token);
     // Cache the minted token so subsequent calls skip the handshake — closes the
     // token-rotation race where overlapping requestModule calls mint fresh tokens
     // that overwrite each other at the target (e.g. QtRO's sync wait reentering
@@ -801,9 +800,6 @@ bool LogosAPIClient::informModuleTokenScoped(const QString& authToken,
             authToken,
             QStringLiteral("capability_module"),
             QStringLiteral("informModuleTokenScoped"),
-            // Generic dispatch only proves that the caller has some issued token.
-            // The capability provider must additionally verify that this is its
-            // trusted core/capability channel before accepting a bootstrap token.
             QVariantList() << authToken << moduleName << instanceId << token,
             Timeout());
         return result.toBool();
