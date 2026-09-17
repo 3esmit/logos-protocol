@@ -58,7 +58,69 @@
  * additive/back-compatible; PATCH never affects compatibility.
  * =========================================================================== */
 
+// HOW TO GUARD A CONDITIONAL SURFACE, and it is not what it looks like.
+//
+// Every entry below is additive at a MINOR, so codegen guards the surface on
+// the version it appeared at. The obvious spelling is wrong:
+//
+//     #if LOGOS_PROTOCOL_VERSION_MINOR >= 5          // WRONG
+//
+// because at 1.0.0 the MINOR resets to 0 and every such guard silently goes
+// false. Nothing fails to build and nothing fails to load — the definitions and
+// the calls disappear together — so the symptom is modules quietly losing
+// teardown and grantability, with no diagnostic anywhere. Compare the pair:
+//
+//     #if defined(LOGOS_PROTOCOL_VERSION_MINOR) &&     // RIGHT
+//         (LOGOS_PROTOCOL_VERSION_MAJOR > 0 ||
+//          (LOGOS_PROTOCOL_VERSION_MAJOR == 0 &&
+//           LOGOS_PROTOCOL_VERSION_MINOR >= 5))
+//
+// Emit the arithmetic expanded rather than behind a function-like macro: the
+// generated sources are resolved by `unifdef` in the backends' ABI checks, and
+// unifdef handles nested integer arithmetic but silently no-ops on what it
+// cannot evaluate. logos-rust-sdk already gets this right by comparing the
+// tuple (major, minor).
 #define LOGOS_PROTOCOL_VERSION_MAJOR 0
+// 0.6: the caller of a dispatch — logos_module_set_call_caller()
+// (logos_module_impl.h), which carries WHO is calling into the module image for
+// the duration of one dispatch, plus the host half that produces the document
+// (logos::CallerScope / logos::currentInboundCallerJson, logos_caller_scope.h,
+// resolved by ModuleProxy::authorize as a by-product of the authorization scan
+// it was already performing).
+//
+// Additive at the ABI level and at the INTERFACE level, which are two separate
+// claims and both matter here. At the ABI: a cdylib generated below 0.6 exports
+// no such symbol and the glue generated alongside it emits no call. At the
+// interface: the caller is NOT a declared parameter and never appears in a
+// .lidl — it is an ambient accessor — so no module's signature changes, nothing
+// opts in per method, and a module that never asks is unaffected.
+//
+// WHY A MINOR AND NOT A PATCH, since the surface is only reachable through a
+// generated call: a new REQUIRED module-impl export is exactly the thing the
+// two prior ABI breaks were. Both (grant_host_services at 0.3, the teardown
+// pair at 0.5) shipped with caller and module in perfect agreement about the
+// version and still failed at dlopen on Linux only, because version agreement
+// says nothing about which SYMBOLS a backend's emitter writes. The MINOR is
+// what the guards are keyed to — the generator guard that emits the call, the
+// backend guard that emits the definition, and the exports.txt every backend
+// diffs itself against — so a surface with no MINOR of its own has no way to be
+// guarded and no way to be checked.
+// 0.5: the module teardown pair — logos_module_about_to_unload() and
+// logos_module_set_unload_done_callback() (logos_module_impl.h), which let a
+// module finish work before it is torn down. Additive at the ABI level: a
+// cdylib generated below 0.5 exports neither, and the glue generated alongside
+// it emits no calls, so an older module keeps the teardown it always had.
+//
+// An earlier version of this note went further and called that arrangement
+// safe. It is not, and the ABI has been broken twice on the strength of it —
+// grant_host_services at 0.3 and this pair at 0.5. Being generated in the same
+// build makes the glue and the module agree on the VERSION; it says nothing
+// about which SYMBOLS a given language backend's emitter writes for that
+// version, because each backend implements this ABI independently. Both
+// breakages happened at perfect version agreement, and both were invisible on
+// macOS and fatal on Linux. See the note above logos_module_about_to_unload in
+// logos_module_impl.h, and nix/module-impl-abi.nix, which publishes this
+// header's export list so every backend can check itself against it.
 // 0.4: per-identity token stores — lp_token_isolate_identity() and the four
 // functions around it (lp_token_identity_is_isolated, lp_token_get_for,
 // lp_token_save_for, lp_token_reset_identity), plus lp_client_create resolving
@@ -81,9 +143,155 @@
 // the provider/host ABI is UNCHANGED, so same-MAJOR hosts (incl. 0.1 daemons)
 // load and forward multi modules without modification. A pre-0.2 *consumer*
 // would see the raw sentinel rather than awaiting it — graceful, not a crash.
-#define LOGOS_PROTOCOL_VERSION_MINOR 4
+// 0.7: an isolated identity's OWN credential — lp_token_adopt_credential(),
+// and the behaviour change that makes it necessary: a private token store is
+// created EMPTY instead of inheriting this image's "core"/"capability_module"
+// tokens. That inheritance handed every isolated identity the HOST's credential,
+// which authorized as the host at any callee (the caller document came back
+// {"kind":"host"}) and satisfied ModuleProxy::informModuleToken's
+// trusted-channel gate — a write into another module's token map, reachable
+// with three public calls and no generated glue.
+//
+// ADDITIVE AT THE ABI, BREAKING FOR ISOLATED IDENTITIES, and the two halves have
+// to be said separately. No symbol changes signature, no module-impl export is
+// added, and a host that never calls lp_token_isolate_identity /
+// TokenManager::isolateIdentity is bit-for-bit unaffected: forIdentity() still
+// returns instance() pointer-identically for every un-isolated name. A host that
+// DOES isolate and does not adopt is broken loudly and immediately — its first
+// outbound call dies at ModuleProxy::authorize's empty-token check with
+// "auth token not recognized" — which is the intended failure mode for a change
+// that removes a credential nobody was entitled to. Ship protocol, then
+// logos-plugin-qt, then the hosts, with matching flake.locks.
+// 0.8: the INBOUND door -- lp_token_save_inbound(), and the module-impl export
+// that carries it across the cdylib boundary
+// (logos_module_accept_inbound_token, logos_module_impl.h).
+//
+// WHAT IT CLOSES. The generated Qt glue's informModuleToken wrote the SAME value
+// through two doors: LogosProviderBase::informModuleToken (inbound, into the
+// HOST image's store) and logos_module_accept_token (which forwarded to
+// lp_token_save -- OUTBOUND, into the cdylib's own store). The value is a
+// CALLER's token, so the second write filed it as a credential this module would
+// PRESENT to that caller. Measured end to end on shipped artifacts: after
+// capability_module minted <A -> B> and pushed it to B, B's own client found it
+// under "A", skipped requestModule, presented it to A, was rejected, and
+// re-exchanged. Every such pair paid a rejection plus a full extra round trip,
+// forever, and the caller saw only success.
+//
+// ADDITIVE AT THE ABI, and unusually cleanly so: no existing symbol changes
+// signature or behaviour, logos_module_accept_token keeps meaning exactly what
+// its name says, and a module generated below 0.8 emits neither the call nor
+// the definition and behaves exactly as it does today.
+//
+// NOT ADDITIVE FOR A TOKEN REGISTRY, which is the one thing to get right when
+// reading this. See lp_token_save_inbound below.
+//
+// AND WHAT DID **NOT** HAPPEN AT 0.7, said here because it nearly cost the
+// fleet. The inbound/outbound split shipped under 0.7 without a version of its
+// own AND with three members where TokenManager had one, which moved m_mutex
+// from +24 to +56 on an object the host allocates and module images mutate.
+// Two versions of that object both answered "0.7.0" and mixing them deadlocked
+// a host process on the first token push, with no diagnostic anywhere. The
+// storage is now a key namespace inside the original single QHash, so the
+// layout is back to what every shipped module was compiled against and MAJOR
+// remains the only gate that has to mean anything. token_manager.h's private
+// section carries the measurements; token_manager.cpp's static_assert is the
+// tripwire.
+// 0.9: subscription continuity -- a per-TARGET status callback, generation
+// counter and restart policy (lp_client_set_subscription_status_cb,
+// lp_client_subscription_generation, lp_client_set_subscription_options,
+// lp_client_rearm_subscriptions), plus the liveness watchdog that makes them
+// mean something (LogosPendingSubscriptions::checkLiveness).
+//
+// WHAT IT CLOSES. A provider that unloads and reloads drives its replica out of
+// Valid and back on the SAME node, and the event helper stays attached to that
+// replica -- so the subscription survives, and NOTHING said so. Events emitted
+// while it was down reached nobody, the stream resumed, and no subscriber could
+// tell that hole from a module that had gone quiet. Nothing was even LOOKING:
+// reconnected() covers a torn-down connection and reviveArmed() a replaced
+// handle, but neither watches a provider die under an already-armed
+// subscription, and the retry timer stopped once everything armed. Detection is
+// the substance of this MINOR; the callback is the cheap half.
+//
+// WHY THE RE-ARM STAYS, rather than "a re-established subscription is a new one,
+// so stop re-arming". It is load-bearing: a module subscribing during init(),
+// and a ui_qml backend during onContextReady(), both run before the dependency
+// calls listen(), and the deferred arm is what makes those work at all.
+// Removing it would hand every consumer that has not adopted the callback
+// SILENT EVENT LOSS -- strictly worse than the silent resume. So the re-arm
+// stays and becomes observable, and {"restart":"manual"} is there for a
+// consumer that would rather be told the stream ended than handed a
+// continuation of it (LP_SUB_HELD instead of LP_SUB_LOST, never both).
+//
+// EVERYTHING IS KEYED BY TARGET MODULE. m_handles holds ONE handle per object
+// name and every subscription to it attaches there, so a provider that dies
+// takes all of them down together; there is no state in which two subscriptions
+// to one module disagree. Keying per subscription reported one event N times
+// and admitted a combination that cannot occur -- an automatic and a manual
+// subscription to the SAME module diverging permanently on the first loss. Two
+// tests in test_subscription_restart_policy.cpp pin the coupling.
+//
+// 0.9 WAS REVISED IN PLACE, which matters because this header promises MINORs
+// are additive. An earlier 0.9 landed on master with the same feature keyed per
+// subscription (lp_subscribe_ex, lp_subscription_generation); those symbols are
+// GONE. That is a removal from a MINOR, allowed exactly once, here, because 0.9
+// had not left the tree -- every consumer was in this repo, the three SDKs and
+// the json-rpc bridge, all moving in the same wave. A later MINOR does not get
+// this latitude.
+//
+// AND THE PRICE, which is worth knowing before you debug it: BOTH cuts report
+// LOGOS_PROTOCOL_VERSION_MINOR 9, so a VERSION guard cannot tell them apart. A
+// consumer still pinned to the first cut (48afc01) sees the removal as a
+// MISSING SYMBOL -- a compile error in C++, and a dlopen-time undefined symbol
+// in Rust, whose extern "C" declarations are unconditional and so link against
+// nothing until load.
+//
+// LOGOS_PROTOCOL_HAS_CLIENT_SUBSCRIPTION_STATE exists for exactly this: a C++
+// consumer that must build against both cuts cannot use `MINOR >= 9`, which
+// compiles the new call sites against a protocol that does not export them.
+// Not hypothetical -- logos-cpp-sdk shipped that guard, and its doctests, which
+// build downstream modules from those modules' OWN older locks, caught it.
+//
+// NOTE FOR ANYONE ADOPTING IT: this macro POSTDATES the revision, so a consumer
+// that must also work against the merged 47d287c has to accept LP_SUB_HELD as
+// well -- that code arrived WITH the client-scoped surface and is absent from
+// every protocol without it. logos-cpp-sdk spells the condition
+// `defined(LOGOS_PROTOCOL_HAS_CLIENT_SUBSCRIPTION_STATE) || defined(LP_SUB_HELD)`
+// for that reason. Guarding on this macro ALONE against 47d287c compiles the
+// feature out silently, which is worse than the build break it replaces.
+//
+// Rust gets no preprocessor and so cannot guard at all; its only defence is
+// closure discipline, one protocol per closure via `follows`.
+//
+// ADDITIVE OTHERWISE: lp_subscribe is retained VERBATIM and everything new is a
+// separate function on lp_client. That spelling is not cosmetic -- logos-rust-sdk
+// hand-declares lp_subscribe in an `extern "C"` block, and Rust does not check
+// it against the real symbol, so an arity change would link against the same
+// name and mis-call it with no diagnostic. The generation counter is maintained
+// for EVERY client, so gap detection reaches a consumer that changes nothing;
+// only the live callback is opt-in.
+#define LOGOS_PROTOCOL_VERSION_MINOR 9
 #define LOGOS_PROTOCOL_VERSION_PATCH 0
-#define LOGOS_PROTOCOL_VERSION_STRING "0.4.0"
+#define LOGOS_PROTOCOL_VERSION_STRING "0.9.0"
+
+// FEATURE MACRO, because the version macros cannot answer this one. Both 0.9
+// cuts report MINOR 9, so `MINOR >= 9` is true of a protocol that has these
+// four symbols and of one that does not. Guard on this instead:
+//
+//     #if defined(LOGOS_PROTOCOL_HAS_CLIENT_SUBSCRIPTION_STATE)
+//
+// Absent below the revision, including on the first cut of 0.9. Defined and
+// never undefined from here on, so a later MINOR keeps satisfying it.
+#define LOGOS_PROTOCOL_HAS_CLIENT_SUBSCRIPTION_STATE 1
+
+// FEATURE MACRO, same reason as the one above, and a THIRD revision reporting
+// MINOR 9. Defined where __logos_call_complete__ became a RESERVED name: a
+// public onEvent() refuses it and wildcard fan-out skips it, so a subscriber
+// that used to receive every deferred call's return value now receives none.
+// That is a behaviour change with no symbol attached, which is precisely what a
+// version guard cannot see. A consumer that read completions off the wildcard
+// — `logosctl watch <module>` with no --event did — guards on this to know
+// whether it still can. Absent before the reservation, never undefined after.
+#define LOGOS_PROTOCOL_HAS_RESERVED_EVENT_NAMES 1
 
 /* ---------------------------------------------------------------------------
  * Export marking.
@@ -181,6 +389,42 @@ typedef void (*lp_result_cb)(int ok, const char* json, void* user_data);
  *  payload), valid only for the duration of the callback. */
 typedef void (*lp_event_cb)(const char* event_name, const char* data_json,
                             void* user_data);
+
+/* Subscription status edges, reported per TARGET MODULE. Plain codes rather
+ * than an enum so the set can grow the way logos_call_error.h's codes do. */
+#define LP_SUB_ARMED      1  /* live; `generation` is THIS establishment's id  */
+#define LP_SUB_LOST       2  /* the provider became unreachable. Events from   */
+                             /* now until the next LP_SUB_ARMED are gone. NOT  */
+                             /* terminal: the SDK re-arms, as it always has.   */
+#define LP_SUB_ABANDONED  3  /* terminal; it will never fire again             */
+#define LP_SUB_HELD       4  /* the provider became unreachable AND the        */
+                             /* target's restart policy is manual, so nothing  */
+                             /* will re-arm itself. Delivered INSTEAD OF       */
+                             /* LP_SUB_LOST, never alongside it, so "did it    */
+                             /* revive itself?" is answered by which code      */
+                             /* arrived. Not terminal:                         */
+                             /* lp_client_rearm_subscriptions() revives it.    */
+
+/** Status callback for lp_client_set_subscription_status_cb.
+ *
+ *  `generation` is which establishment the TARGET is on: 1 for the first, N+1
+ *  for each re-establishment. A LP_SUB_LOST followed by LP_SUB_ARMED with a
+ *  higher generation is the unrecoverable-gap marker — the pair a subscriber
+ *  needs in order to tell "the provider restarted and I missed events" from
+ *  "the module has been quiet".
+ *
+ *  `reason` is a lowercase snake_case code on LOST/HELD/ABANDONED
+ *  ("provider_unavailable", "connection_reset", "object_unreachable"), NULL on
+ *  ARMED. Valid only
+ *  for the duration of the callback.
+ *
+ *  Fires on the client's owner thread — the same thread as lp_event_cb.
+ *
+ *  `generation` is `unsigned long long`, not uint64_t, because this header has
+ *  no includes at all and gains nothing by growing one — every binding parses
+ *  it raw. The two are the same width on every platform this ships to. */
+typedef void (*lp_subscription_status_cb)(int state, unsigned long long generation,
+                                          const char* reason, void* user_data);
 
 /**
  * Create a client for calling `target_module` on behalf of `origin_module`.
@@ -309,6 +553,92 @@ LP_API lp_subscription* lp_subscribe(lp_client* client,
                               lp_event_cb cb,
                               void* user_data);
 
+/**
+ * Watch a TARGET MODULE's subscription transitions.
+ *
+ * lp_subscribe tells you an event arrived and nothing else -- not that the
+ * provider died and came back, because the SDK re-arms silently and the stream
+ * resumes with a hole in it. This is how you find out:
+ *
+ *     LP_SUB_ARMED(1) ... LP_SUB_LOST(1) ... LP_SUB_ARMED(2)
+ *
+ * where the gap between LOST and the next ARMED is unrecoverable.
+ *
+ * PER CLIENT, WHICH IS PER TARGET MODULE: a client names one target and every
+ * lp_subscribe through it attaches to that module's single handle, so they are
+ * lost and re-established together. Installable BEFORE any subscription exists,
+ * and replays the current state, so no ordering can miss the arm.
+ *
+ * Passing NULL removes the watcher. Returns 1 on success, 0 for a NULL client.
+ */
+LP_API int lp_client_set_subscription_status_cb(lp_client* client,
+                                         lp_subscription_status_cb status_cb,
+                                         void* user_data);
+
+/**
+ * Which establishment this client's target is on: 0 = never armed, 1 = the
+ * first, N+1 after each re-establishment.
+ *
+ * Maintained for EVERY client, including one that never installs a status
+ * callback — so an existing consumer gains gap detection by reading this next
+ * to each delivered event and noticing it change, without altering how it
+ * subscribes or adopting a callback at all. 0 for a null handle.
+ */
+LP_API unsigned long long lp_client_subscription_generation(lp_client* client);
+
+/**
+ * Set subscription options for this client's target module.
+ *
+ * `options_json` is a JSON object, or NULL/empty for defaults. Unknown keys are
+ * IGNORED, so a newer caller against an older runtime loses the OPTION, not its
+ * subscriptions.
+ *
+ *   {"restart": "automatic"}   the default: re-arm on provider loss and keep
+ *                              delivering, the gap visible as LP_SUB_LOST ->
+ *                              LP_SUB_ARMED(generation+1).
+ *   {"restart": "manual"}      hold instead: report LP_SUB_HELD, stop chasing,
+ *                              and stay down until
+ *                              lp_client_rearm_subscriptions(). For a consumer
+ *                              that must refetch state before the next event
+ *                              means anything.
+ *
+ * MANUAL DOES NOT AFFECT THE FIRST ARM. A subscription taken before its
+ * provider has called listen() -- a module's init(), a UI backend's
+ * onContextReady() -- is deferred and armed under either policy. That is why
+ * this is safe to adopt anywhere.
+ *
+ * One policy per target, for the same reason the status callback is per target.
+ * Takes effect on the next loss and never revives anything by itself: setting
+ * "automatic" on a held target does NOT re-arm it.
+ *
+ * JSON rather than a flags word so a future option is a new key, ignorable by
+ * an older runtime and omittable by an older caller.
+ *
+ * Returns 1 on success, 0 for a NULL client or unparseable JSON.
+ */
+LP_API int lp_client_set_subscription_options(lp_client* client,
+                                       const char* options_json);
+
+/**
+ * Revive this client's target if its subscriptions are HELD.
+ *
+ * Puts them back in the pending set and chases the provider again, arming
+ * immediately if it is already back. The generation advances on the ARM, so a
+ * watcher still sees LP_SUB_HELD(N) -> LP_SUB_ARMED(N+1) and can tell the gap
+ * happened.
+ *
+ * EVENTUAL, not immediate, and for the same reason lp_unsubscribe's de-tracking
+ * half is: it is posted to the client's owner thread rather than marshalled
+ * synchronously onto it. That is what makes it safe to call from INSIDE the
+ * status callback — which is the obvious place to call it from, and would
+ * otherwise be a lock-order inversion against the delivery guard.
+ *
+ * Returns 1 if the revive was accepted, 0 for a NULL client or a target with no
+ * held subscriptions — including one still waiting for its FIRST arm, which
+ * needs no reviving because it was never held.
+ */
+LP_API int lp_client_rearm_subscriptions(lp_client* client);
+
 /** Cancel a subscription. After this returns the callback will not fire again
  *  (already-running invocations are allowed to finish first) — that part is
  *  synchronous and unconditional.
@@ -345,17 +675,101 @@ LP_API char* lp_get_methods(lp_client* client);
 
 /* ---------------------------------------------------------------------------
  * Tokens
+ *
+ * THE WHOLE lp_token_* FAMILY IS THE **OUTBOUND** FAMILY, and this paragraph is
+ * the contract, not a description of today's callers. `module_name` everywhere
+ * below is the module being CALLED, and the value is the token this image will
+ * PRESENT to it. None of these writes authorizes anybody to call US.
+ *
+ * ONE FUNCTION HERE IS NOT OUTBOUND, and it is the last one in the section:
+ * lp_token_save_inbound, added at 0.8. Everything named above it is outbound;
+ * it is placed after the family and labelled at every mention so the paragraph
+ * above stays readable as the rule it is.
+ *
+ * WHY AN INBOUND DOOR EXISTS AT ALL, since an earlier version of this note
+ * argued one was UNREPRESENTABLE and that the absence was a stronger guarantee
+ * than a doc comment on a door that exists. The argument was that a cdylib has
+ * no LogosAPI, no ModuleProxy and never authorizes, so every read of its store
+ * is an outbound presentation. Both halves are true and neither is the point:
+ * the problem was never a cdylib READING inbound, it was the generated glue
+ * WRITING a caller's token through the only door available, which was the
+ * outbound one. With one door the direction had nowhere to go, so an inbound
+ * grant landed in the outbound cache and the module then presented a peer's own
+ * token back at that peer. Measured end to end on shipped artifacts: after
+ * capability_module minted <A -> B> and pushed it to B, B's client found the
+ * value under "A", skipped requestModule, presented it to A, was rejected, and
+ * re-exchanged -- a rejection plus a full extra round trip on every call of
+ * every two-way pair, permanently, reported to the caller as success. A second
+ * door is what gives the inbound value somewhere to land that no outbound read
+ * can reach.
+ *
+ * `logos_module_accept_token` (logos_module_impl.h) is therefore the OUTBOUND
+ * door and nothing else -- the module's own anchor, seeded in the glue's
+ * onInit. The caller path goes through logos_module_accept_inbound_token.
+ * Both backends owe the new definition in the same wave as the declaration:
+ * miss one and it links clean and dies at dlopen with an undefined symbol, on
+ * Linux only, invisible on macOS. logos_module_impl.h records that this has
+ * shipped twice at perfect version agreement. Note also that the
+ * module-impl-abi checks in both SDKs only go red AFTER each bumps its
+ * logos-protocol lock: declaring alone turns nothing red, and that lag is the
+ * real risk.
  * ------------------------------------------------------------------------- */
 
-/** Get the stored token for `module_name`. Returns NULL when absent;
- *  caller frees via lp_string_free.
+/** Get the OUTBOUND token for `module_name` — what this image presents when it
+ *  CALLS `module_name`. Returns NULL when absent; caller frees via
+ *  lp_string_free.
  *
  *  Reads this IMAGE's store — the one lp_client_create uses for every origin
- *  that has not been isolated. For an isolated origin, see lp_token_get_for. */
+ *  that has not been isolated. For an isolated origin, see lp_token_get_for.
+ *
+ *  Does NOT see tokens this image issued to its own callers: those live in the
+ *  inbound half, which has no lp_* reader by design (see above). */
 LP_API char* lp_token_get(const char* module_name);
 
-/** Store a token for `module_name` in this image's store. */
+/** Store the OUTBOUND token for `module_name` — what this image will present
+ *  when it CALLS `module_name`.
+ *
+ *  Storing a token here does not let `module_name` call US. When `module_name`
+ *  is "core" or "capability_module" this also installs the value as this
+ *  store's identity credential, which is how the generated glue's
+ *  logos_module_accept_token("core") seeding keeps working unchanged. */
 LP_API int lp_token_save(const char* module_name, const char* token);
+
+/** THE INBOUND DOOR (protocol 0.8). Record that `caller` may present `token`
+ *  when it calls THIS image. The mirror of lp_token_save, and the ONE function
+ *  in this family that is not outbound.
+ *
+ *  Writes the inbound key namespace, which lp_token_get and lp_token_keys
+ *  cannot read and no outbound presentation can reach. Refuses an empty name or
+ *  token, and refuses a name carrying the reserved namespace character --
+ *  `caller` arrives over RPC, named by capability_module, so it must not be able
+ *  to address any key but its own.
+ *
+ *  THE TOKEN-REGISTRY CARVE-OUT, and it is the whole reason this is not simply
+ *  "the inbound half of lp_token_save". The same wire message means opposite
+ *  things depending on WHO RECEIVES IT. To an ordinary provider,
+ *  informModuleToken(caller, token) is "caller may present this to you" --
+ *  inbound. To the module holding the token registry it is "here is module X's
+ *  token; present it when you call X" -- outbound, and the same map is also the
+ *  roster that answers "is this caller a module I know". capability_module reads
+ *  exactly that: lp_token_keys() for the known-caller gate, lp_token_get() for
+ *  the credential it presents when pushing to the target.
+ *
+ *  So when, and only when, this image holds the "token_registry" grant, this
+ *  ALSO writes the outbound half. Without the carve-out, routing the glue's
+ *  second write here empties capability_module's roster and every cross-module
+ *  call in the fleet is refused with "rejecting request from unknown module
+ *  identity" -- fail-closed, but a fleet-wide lockout at the first call.
+ *
+ *  The grant is the right discriminator rather than a codegen flag: it IS the
+ *  declaration of the registry role (metadata.json host_services), it is off by
+ *  default and fail-closed, it is already what gates lp_token_keys, and it lives
+ *  in the image whose store is being written. A per-module codegen flag would
+ *  add a second place for the two to disagree -- and the glue generator is
+ *  handed a LIDL contract, not metadata, so it cannot see host_services at all.
+ *
+ *  Returns 0 on acceptance. */
+LP_API int lp_token_save_inbound(const char* caller, const char* token);
 
 /* --- per-identity token stores ---------------------------------------------
  *
@@ -371,9 +785,12 @@ LP_API int lp_token_save(const char* module_name, const char* token);
  * and every lp_client_create behaves exactly as before, on the same store.
  * ------------------------------------------------------------------------- */
 
-/** Give `identity` a private token store, seeded with the trust-root bootstrap
- *  ("core" and "capability_module", copied from this image's store) so its first
- *  call can still run the `requestModule` handshake.
+/** Give `identity` a private token store. The store is created EMPTY — it does
+ *  NOT inherit this image's "core" / "capability_module" tokens, which are the
+ *  HOST's credential and would let the identity authorize as the host. The host
+ *  must give the identity its OWN credential with lp_token_adopt_credential
+ *  before it can call anything; until then every call it makes is refused.
+ *
  *
  *  Idempotent. Returns LP_ERR_UNSUPPORTED — changing nothing — if a client for
  *  this identity was already created against the shared store; isolating then
@@ -393,7 +810,10 @@ LP_API int lp_token_identity_is_isolated(const char* identity);
 LP_API char* lp_token_get_for(const char* identity, const char* module_name);
 
 /** Store a token in `identity`'s store — how a host seeds an isolated identity
- *  with the tokens it is actually entitled to. Writes this image's shared store
+ *  with the tokens it is actually entitled to. For the identity's OWN
+ *  credential, use lp_token_adopt_credential instead: it owns the bootstrap key
+ *  set, so a binding never has to spell "core"/"capability_module" itself.
+ *  Writes this image's shared store
  *  for an identity that has not been isolated, which is almost certainly not
  *  what the caller meant: the token becomes visible to every other non-isolated
  *  caller, and lp_token_isolate_identity then refuses the name rather than
@@ -401,14 +821,35 @@ LP_API char* lp_token_get_for(const char* identity, const char* module_name);
 LP_API int lp_token_save_for(const char* identity, const char* module_name,
                              const char* token);
 
-/** Clear an isolated identity's store and re-seed the bootstrap — the unload
- *  hook, so a reloaded module does not present tokens minted for its previous
- *  incarnation. Returns LP_ERR_UNSUPPORTED for a non-isolated identity, whose
- *  store is shared and must not be cleared out from under everyone else. */
+/** Clear an isolated identity's store — the unload hook, so a reloaded module
+ *  does not present tokens minted for its previous incarnation. The identity's
+ *  CREDENTIAL goes with it: a reload re-mints and re-registers, which
+ *  invalidates the old credential at the target, so the caller must follow this
+ *  with lp_token_adopt_credential for the new one. Returns LP_ERR_UNSUPPORTED
+ *  for a non-isolated identity, whose store is shared and must not be cleared
+ *  out from under everyone else. */
 LP_API int lp_token_reset_identity(const char* identity);
 
-/** The module names this image's token store holds, as a JSON array. Caller
- *  frees via lp_string_free.
+/** Install `credential` as `identity`'s OWN credential in its private store:
+ *  its value under every bootstrap key ("core", "capability_module"). This is
+ *  what makes an isolated identity able to speak at all — it is the token
+ *  presented to `capability_module.requestModule`, and the token
+ *  capability_module pushes back with.
+ *
+ *  The host mints `credential`, registers it with capability_module
+ *  (lp_inform_module_token / informModuleToken over the trusted channel) and
+ *  only THEN calls this. Register-before-adopt, so at no instant does the
+ *  identity hold a credential capability_module has not yet accepted.
+ *
+ *  Returns LP_ERR_INVALID_ARG for a NULL/empty argument, and LP_ERR_UNSUPPORTED
+ *  — writing nothing — when `identity` is not isolated (the store would be the
+ *  shared one, handing the credential to every un-isolated caller) or when
+ *  `credential` is this image's own host anchor (adopting the host's credential
+ *  as your own is the elevation this whole surface exists to prevent). */
+LP_API int lp_token_adopt_credential(const char* identity, const char* credential);
+
+/** The module names this image's OUTBOUND token store holds, as a JSON array.
+ *  Caller frees via lp_string_free.
  *
  *  Requires the "token_registry" host service (lp_grant_host_services): an
  *  ungranted image gets NULL. NULL is therefore "refused", never "empty" — a

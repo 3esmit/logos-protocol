@@ -81,9 +81,6 @@ public:
                               TokenManager* token_manager,
                               QObject *parent = nullptr);
 
-    // Convenience instance-aware variant using the process-global transport
-    // configuration. It preserves the name-only constructor when the supplied
-    // instance ID is empty.
     LogosAPIConsumer(const QString& module_to_talk_to,
                      const QString& origin_module,
                      TokenManager* token_manager,
@@ -105,6 +102,18 @@ public:
      */
     LogosObject* cachedObject(const QString& objectName);
 
+    /**
+     * @brief Acquire `objectName` into the handle cache, waiting up to `timeoutMs`,
+     *        and report whether it is now reachable.
+     *
+     * The question `invokeRemoteMethod` asks first anyway, asked separately so a caller
+     * can order something else against it. The handle is LEFT IN THE CACHE, so the
+     * acquire inside a later `invokeRemoteMethod` on this consumer is a hit rather than
+     * a second wait — that coupling is load-bearing, and a caller routing around
+     * `acquireCachedObject` would pay this budget twice.
+     */
+    bool ensureTargetAcquirable(const QString& objectName, int timeoutMs);
+
     bool isConnected() const;
     QString registryUrl() const;
     bool reconnect();
@@ -116,10 +125,11 @@ public:
      * @brief invokeRemoteMethod with an explicit error out-channel.
      *
      * Fills *err with the canonical {code, message, origin} call error when
-     * the failure is detectable on this side: "object_unavailable" when the
-     * target object/replica cannot be acquired, or "invoke_failed" when the
-     * target provider throws. On success *err is cleared. Failures the
-     * transport cannot yet distinguish from a void result leave *err clear.
+     * the failure is detectable on this side (today: "object_unavailable"
+     * when the target object/replica cannot be acquired). On success *err is
+     * cleared. Failures the transport cannot yet distinguish from a void
+     * result (per-dispatch errors) leave *err clear — the struct is the
+     * extension point for surfacing transport-level statuses later.
      */
     QVariant invokeRemoteMethod(const QString& authToken, const QString& objectName, const QString& methodName,
                              const QVariantList& args, Timeout timeout, logos::CallError* err);
@@ -154,11 +164,10 @@ public:
     /**
      * @brief invokeRemoteMethodAsync with an explicit error out-channel.
      *
-     * Sets the CallError to code="object_unavailable" when acquire fails or
-     * code="invoke_failed" when the target provider throws (matching the sync
-     * overload's semantics — see logos_call_error.h), cleared on success.
-     * Callers that need to react differently from "call returned no value"
-     * should use this overload.
+     * Sets the CallError to code="object_unavailable" when acquire fails
+     * (matching the sync overload's semantics — see logos_call_error.h),
+     * cleared on success. Callers that need to react to acquire failure
+     * differently from "call returned no value" should use this overload.
      */
     void invokeRemoteMethodAsync(const QString& authToken, const QString& objectName, const QString& methodName,
                                  const QVariantList& args,
@@ -222,11 +231,15 @@ public:
      * missed": a module whose startup event matters must also expose a pull
      * method the subscriber can call after arming.
      *
+     * @param eventName The event to subscribe to, or EMPTY for every event on
+     *                  the object — the same wildcard the plain onEvent()
+     *                  accepts, and delivered by the same mechanism.
      * @param onArmed Optional; called with true the moment the subscription
      *                goes live, or false if it is abandoned. Never called for
      *                "not yet".
      * @return A non-zero id for cancelEventSubscription() /
-     *         eventSubscriptionState(), or 0 if the arguments were refused.
+     *         eventSubscriptionState(), or 0 if the arguments were refused —
+     *         an empty objectName or a null callback, and nothing else.
      */
     quint64 onEventWhenAvailable(const QString& objectName,
                                  const QString& eventName,
@@ -278,6 +291,106 @@ public:
     bool cancelEventSubscription(quint64 subscriptionId);
 
     /**
+     * @brief Watch a TARGET MODULE's subscription transitions.
+     *
+     * onEventWhenAvailable()'s `onArmed` answers a bool, which can say "live"
+     * and "given up" and nothing else. It cannot say the thing that matters
+     * afterwards: the provider went away and came back, so every subscription
+     * to it is new and the events in between are gone.
+     *
+     * KEYED BY OBJECT, NOT BY SUBSCRIPTION. m_handles holds ONE handle per
+     * object name and every subscription to it attaches there, so a provider
+     * that dies takes all of them down together. A per-subscription callback
+     * reported one event N times; two tests in
+     * test_subscription_restart_policy.cpp pin that the halves cannot differ.
+     *
+     * Fires on every transition of the OBJECT:
+     *   Armed(generation)     — live; 1 for the first establishment, N+1 after.
+     *   Lost(generation)      — the handle stopped being valid. NOT terminal:
+     *                           the registry re-arms as always.
+     *   Held(generation)      — same loss under a Manual policy, so nothing is
+     *                           being chased. Reported INSTEAD OF Lost, never
+     *                           alongside it; rearmSubscriptions() revives it.
+     *   Abandoned(generation) — terminal.
+     *
+     * `reason` is a lowercase snake_case code on Lost/Held/Abandoned
+     * ("provider_unavailable", "connection_reset", "object_unreachable"), empty
+     * on Armed.
+     *
+     * Installable BEFORE any subscription to the object exists, and replays the
+     * current state if it is already armed or held — so no ordering misses the
+     * arm.
+     *
+     * A separate installer rather than a parameter on onEventWhenAvailable():
+     * logos-rust-sdk hand-declares that function's C-ABI twin in an `extern "C"`
+     * block, and Rust does not check a hand-written declaration against the real
+     * symbol, so an arity change would mis-call it with no diagnostic.
+     */
+    void setSubscriptionStatusCallback(
+        const QString& objectName,
+        std::function<void(LogosSubscriptionEvent, quint64 generation,
+                           const QString& reason)> onStatus);
+
+    /**
+     * @brief Which establishment this object's subscriptions are currently on.
+     *
+     * 0 = never armed, 1 = the first arming, N+1 after each re-establishment.
+     * A caller that reads this alongside each delivered event and sees it
+     * change has observed an unrecoverable gap — which makes gap DETECTION
+     * available to every existing subscriber without changing how they
+     * subscribe, even one that never installs a status callback.
+     *
+     * Per OBJECT for the same reason the callback is: a subscription taken
+     * after a restart shares its provider's history whether or not it watched
+     * it happen, and two subscriptions to one module cannot be on different
+     * establishments of it.
+     */
+    quint64 subscriptionGeneration(const QString& objectName) const;
+
+    /**
+     * @brief Choose what happens when this object's provider goes away.
+     *
+     * Automatic (the default, and what every subscription has always done)
+     * re-arms and keeps delivering once the provider returns, with the gap
+     * reported as Lost -> Armed(generation+1).
+     *
+     * Manual holds them instead: the object reports Held, stops being chased,
+     * and stays that way until rearmSubscriptions(). Use it when resuming
+     * mid-stream is worse than not resuming — a consumer that has to refetch
+     * state before it can interpret the next event, say.
+     *
+     * ONE POLICY PER OBJECT, not per subscription. A per-subscription policy
+     * let an Automatic and a Manual subscription to the SAME module diverge
+     * permanently on the first loss — one revived, one held — over an event
+     * that is indivisibly per-module. There is no use for that, and it is
+     * pinned as impossible by MixedPoliciesOnOneModuleDiverge's replacement.
+     *
+     * Settable BEFORE any subscription to the object exists, and it never fails.
+     *
+     * MANUAL DOES NOT AFFECT THE FIRST ARM. A subscription taken during init(),
+     * before its provider has called listen(), is deferred and armed exactly as
+     * it always was under either policy; the policy only decides what happens
+     * to subscriptions that have ALREADY armed and then lost their provider.
+     *
+     * Takes effect on the next loss. Setting Automatic on a currently-held
+     * object does not revive it — call rearmSubscriptions().
+     */
+    void setSubscriptionRestartPolicy(const QString& objectName, LogosRestartPolicy policy);
+
+    /**
+     * @brief Revive an object's Held subscriptions.
+     *
+     * Puts them back in the pending set and chases the provider again, arming
+     * immediately if it is already back. The generation advances on the ARM, so
+     * a watcher still sees Held(N) -> Armed(N+1) and can tell the gap happened.
+     *
+     * @return false if the object has no held subscriptions — including one
+     *         whose subscriptions are still waiting for their FIRST arm, which
+     *         need no reviving because they were never held.
+     */
+    bool rearmSubscriptions(const QString& objectName);
+
+    /**
      * @brief Whether a subscription id is still pending, armed, or forgotten.
      *
      * Lets a caller that keeps its own de-duplication record check it against
@@ -312,7 +425,10 @@ private:
     // surface refused the push because the target is still initializing.
     // Deliberately NOT a slot: it is an internal step of informModuleToken_module,
     // not a separate remote entry point.
-    bool informModuleTokenViaBusinessObject(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs);
+    // `reachedModule`, when given, reports whether the business object was ACQUIRABLE —
+    // which is the only evidence that distinguishes a module with no handshake surface from
+    // one that had simply not published yet. See the negative cache in informModuleToken.
+    bool informModuleTokenViaBusinessObject(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs, bool* reachedModule = nullptr);
 
     // Get a cached remote-object handle for objectName, (re)acquiring via the
     // transport if absent or stale. Acquiring a QtRO replica (acquireDynamic +
@@ -329,11 +445,19 @@ private:
     // Object-handle cache keyed by object name. Single-threaded: touched only on
     // the consumer's event-loop thread.
     QHash<QString, LogosObject*> m_objectCache;
-    // Handshake object names known to be absent. acquireCachedObject caches only
-    // successes, so without this a module built before the handshake surface
-    // existed would pay the full probe budget on every single grant. Cleared by
-    // clearObjectCache() so a reconnect or a reloaded module is re-probed.
+    // Handshake object names PROVEN absent — the module answered on its business object
+    // and had no such surface. acquireCachedObject caches only successes, so without this
+    // a module built before the handshake surface existed would pay the full probe budget
+    // on every single grant.
+    //
+    // Proven, not merely observed: a probe also misses when the module has not published
+    // yet, and entering that here would write a late module off for the life of the
+    // process. `clearObjectCache()` covers destroy and registry reconnect, and a module
+    // that was simply slow is neither.
     QSet<QString> m_noHandshakeSurface;
+
+    // Build the pending-subscription registry if it does not exist yet.
+    void ensureRegistry();
 
     // Deferred event subscriptions (onEventWhenAvailable). Appended LAST and
     // held by pointer on purpose: an opaque forward declaration keeps this

@@ -1,5 +1,6 @@
 #include "remote_transport.h"
 #include "../../logos_async_dispatch.h"
+#include "../../logos_object_source_watch.h"
 #include "../../logos_socket_paths.h"
 #include "qt_socket_path.h"
 #include <QRemoteObjectRegistryHost>
@@ -17,6 +18,7 @@
 #include <QJsonArray>
 #include <QVariantMap>
 #include <atomic>
+#include <memory>
 
 // Process-wide count of replicas acquired by requestObject() — a test hook to
 // prove the consumer reuses one cached handle instead of re-acquiring per call.
@@ -28,10 +30,18 @@ using logos::qtremote::localSocketFilePath;
 
 namespace {
 
+// Shared by a handle and its replica's stateChanged handler, so neither outlives what it reads.
+struct SourceWatchState {
+    bool bound = false;
+    bool lost = false;
+    std::function<void()> onLost;
+};
+
 class RemoteEventHelper : public QObject {
     Q_OBJECT
 public:
-    explicit RemoteEventHelper(QObject* parent = nullptr) : QObject(parent) {}
+    explicit RemoteEventHelper(std::shared_ptr<const SourceWatchState> watch)
+        : m_watch(std::move(watch)) {}
 
     void addCallback(const QString& eventName, LogosObject::EventCallback cb) {
         m_callbacks[eventName].append(std::move(cb));
@@ -41,10 +51,16 @@ public slots:
     void onEventResponse(const QString& eventName, const QVariantList& data) {
         // Dispatch to callbacks registered for this specific event name,
         // plus any wildcard subscribers (callbacks registered with an
-        // empty event name, meaning "receive every event").
+        // empty event name, meaning "receive every event") — except for a
+        // reserved name, which no wildcard carries and which only the
+        // completion callback wired up in the constructor ever asked for. It
+        // also dispatches without a log line, being one per deferred call.
+        const bool reserved = logos::isReservedEventName(eventName);
+        // A bound handle whose source went away must not hand the replacement's events to old subscribers.
+        if (!reserved && m_watch->bound && m_watch->lost) return;
         auto cbs = m_callbacks.value(eventName);
-        cbs.append(m_callbacks.value(QString()));
-        if (!cbs.isEmpty()) {
+        if (!reserved) cbs.append(m_callbacks.value(QString()));
+        if (!cbs.isEmpty() && !reserved) {
             qDebug() << "[LogosObject] Remote EventHelper: dispatching event" << eventName << "to" << cbs.size() << "callback(s) (via IPC)";
         }
         for (const auto& cb : cbs) {
@@ -54,11 +70,13 @@ public slots:
 
 private:
     QHash<QString, QList<LogosObject::EventCallback>> m_callbacks;
+    std::shared_ptr<const SourceWatchState> m_watch;
 };
 
 } // anonymous namespace
 
-class RemoteLogosObject : public LogosObject, public LogosObjectErrorChannel {
+class RemoteLogosObject : public LogosObject, public LogosObjectErrorChannel,
+                          public LogosObjectSourceWatch {
 public:
     // objectName is carried purely so a failure can name the module it belongs
     // to — logos::CallError::origin, the same field the acquire-time error and
@@ -71,7 +89,7 @@ public:
             // Eager event wiring — a deferred ("multi") call's result arrives as a
             // completion event, so the channel must be live even when the caller
             // never subscribes to a user event. onEvent() reuses this same helper.
-            m_helper = new RemoteEventHelper();
+            m_helper = new RemoteEventHelper(m_watch);
             QObject::connect(m_replica, SIGNAL(eventResponse(QString,QVariantList)),
                              m_helper, SLOT(onEventResponse(QString,QVariantList)));
             m_helper->addCallback(logos::callCompleteEvent(),
@@ -110,6 +128,7 @@ public:
 
     ~RemoteLogosObject() override {
         qDebug() << "[LogosObject] Destroying RemoteLogosObject" << reinterpret_cast<quintptr>(m_replica);
+        m_watch->onLost = nullptr;   // the replica may outlive us and still emit stateChanged
         // release() normally clears m_helper first (deferred). If we get here on a
         // direct delete, defer the helper too: a direct delete can still be reached
         // from within the helper's own slot dispatch. See disconnectEvents().
@@ -373,10 +392,14 @@ public:
     void onEvent(const QString& eventName, EventCallback callback) override
     {
         if (!m_replica) return;
+        if (logos::isReservedEventName(eventName)) {
+            qWarning() << "[LogosObject] RemoteLogosObject::onEvent: refusing to subscribe to reserved event" << eventName;
+            return;
+        }
 
         qDebug() << "[LogosObject] RemoteLogosObject::onEvent subscribing to event:" << eventName;
         if (!m_helper) {
-            m_helper = new RemoteEventHelper();
+            m_helper = new RemoteEventHelper(m_watch);
             QObject::connect(m_replica, SIGNAL(eventResponse(QString,QVariantList)),
                              m_helper, SLOT(onEventResponse(QString,QVariantList)));
             qDebug() << "[LogosObject] RemoteLogosObject: connected EventHelper to QRemoteObjectReplica signals (IPC)";
@@ -428,6 +451,7 @@ public:
 
     void release() override
     {
+        m_watch->onLost = nullptr;       // whoever bound us is letting go; never call it again
         disconnectEvents();              // defers the helper (signal receiver)
         // The replica is the QtRO signal *sender* whose eventResponse() may be the
         // very emission that re-entered release() (a deferred completion event).
@@ -451,6 +475,29 @@ public:
     {
         auto* r = qobject_cast<QRemoteObjectReplica*>(m_replica);
         return r && r->state() == QRemoteObjectReplica::Valid;
+    }
+
+    bool sourceLost() const override { return m_watch->lost; }
+
+    // QtRO re-attaches a facade to a replacement source, so isValid() alone cannot tell a sub-second swap
+    // from continuity. Every loss passes through setState(Suspect), which stateChanged reports synchronously.
+    void bindToSource(std::function<void()> onLost) override
+    {
+        m_watch->onLost = std::move(onLost);
+        if (m_watch->bound) return;
+        m_watch->bound = true;
+        auto* rep = qobject_cast<QRemoteObjectReplica*>(m_replica);
+        if (!rep || rep->state() != QRemoteObjectReplica::Valid) {
+            m_watch->lost = true;
+            return;
+        }
+        std::shared_ptr<SourceWatchState> watch = m_watch;
+        QObject::connect(rep, &QRemoteObjectReplica::stateChanged, rep,
+            [watch](QRemoteObjectReplica::State now, QRemoteObjectReplica::State) {
+                if (now == QRemoteObjectReplica::Valid || watch->lost) return;
+                watch->lost = true;
+                if (watch->onLost) watch->onLost();
+            });
     }
 
 private:
@@ -491,6 +538,7 @@ private:
     QHash<QString, QEventLoop*> m_completionWaiters;
     QHash<QString, AsyncResultErrorCallback> m_asyncCompletionCbs;
     QString m_objectName;
+    std::shared_ptr<SourceWatchState> m_watch = std::make_shared<SourceWatchState>();
 };
 
 // ── PendingAcquire ───────────────────────────────────────────────────────────
@@ -671,6 +719,7 @@ RemoteTransportConnection::~RemoteTransportConnection()
     // Pending replicas and parked probes belong to the node; kill them FIRST so
     // none outlives it.
     m_probes.clear();
+    m_parked.clear();
     delete m_pendingAcquires;
     m_pendingAcquires = nullptr;
     delete m_node;
@@ -731,6 +780,7 @@ bool RemoteTransportConnection::reconnect()
         // consumer's subscription registry re-arms against the new node
         // (LogosAPIConsumer::reconnect -> reconnected()).
         m_probes.clear();
+        m_parked.clear();
         delete m_pendingAcquires;
         m_pendingAcquires = new QObject();
         delete m_node;
@@ -795,7 +845,10 @@ LogosObject* RemoteTransportConnection::requestObject(const QString& objectName,
     qDebug() << "RemoteTransportConnection: Requesting object:" << objectName
              << "at" << QTime::currentTime().toString("hh:mm:ss.zzz");
 
-    QRemoteObjectReplica* replica = m_node->acquireDynamic(objectName);
+    // Wait on the facade an earlier timeout parked for this name rather than
+    // adding a second one for the implementation to hold raw.
+    QRemoteObjectReplica* replica = takeParked(objectName);
+    if (!replica) replica = m_node->acquireDynamic(objectName);
     if (!replica) {
         qWarning() << "RemoteTransportConnection: Failed to acquire replica for:" << objectName;
         return nullptr;
@@ -803,7 +856,14 @@ LogosObject* RemoteTransportConnection::requestObject(const QString& objectName,
 
     if (!replica->waitForSource(timeoutMs)) {
         qWarning() << "RemoteTransportConnection: Timeout waiting for replica:" << objectName;
-        delete replica;
+        // PARK it; do NOT free it. A timeout means the class definition never
+        // arrived, so this facade is still listed RAW in the implementation's
+        // m_parentsNeedingConnect -- see m_probes. Freeing it here is the
+        // use-after-free that killed the json_rpc_bridge host: the module came
+        // back a second later, the source's dynamic API landed in
+        // QRemoteObjectNodePrivate::onClientRead, and setDynamicProperties()
+        // walked the list into the freed facade.
+        parkOrDelete(objectName, replica);
         return nullptr;
     }
 
@@ -885,6 +945,50 @@ LogosObject* RemoteTransportConnection::tryAcquireNow(const QString& objectName)
 
     g_acquireCount.fetch_add(1, std::memory_order_relaxed);
     return new RemoteLogosObject(replica, objectName);
+}
+
+// Uninitialized is exactly "the implementation has no metaobject yet" for a
+// dynamic replica, which is exactly when it lists this facade raw. In any other
+// state the implementation had already synced and connected the facade
+// directly, so it is no longer in that list and freeing it is safe.
+void RemoteTransportConnection::parkOrDelete(const QString& objectName,
+                                             QRemoteObjectReplica* replica)
+{
+    if (!replica) return;
+    if (replica->state() != QRemoteObjectReplica::Uninitialized) {
+        delete replica;
+        return;
+    }
+    // Parented to m_pendingAcquires, which both ~RemoteTransportConnection and
+    // reconnect() destroy BEFORE the node -- so a parked facade never outlives
+    // the implementation that points at it. If that parent is already gone we
+    // still refuse to free it: leaking one facade beats a use-after-free.
+    if (m_pendingAcquires) replica->setParent(m_pendingAcquires);
+    m_parked[objectName].append(replica);
+}
+
+// Removes the facade BEFORE the caller's waitForSource() pumps a nested event
+// loop. A requestObject() re-entered from that loop must not find the same
+// facade parked and hand it over a second time.
+QRemoteObjectReplica* RemoteTransportConnection::takeParked(const QString& objectName)
+{
+    auto it = m_parked.find(objectName);
+    if (it == m_parked.end()) return nullptr;
+    QRemoteObjectReplica* replica = nullptr;
+    while (!replica && !it->isEmpty()) replica = it->takeLast();   // QPointers may have gone null
+    if (it->isEmpty()) m_parked.erase(it);
+    if (replica) replica->setParent(nullptr);   // the caller owns it while it waits
+    return replica;
+}
+
+int RemoteTransportConnection::parkedCount(const QString& objectName) const
+{
+    const auto it = m_parked.constFind(objectName);
+    if (it == m_parked.constEnd()) return 0;
+    int alive = 0;
+    for (const QPointer<QRemoteObjectReplica>& parked : *it)
+        if (parked) ++alive;
+    return alive;
 }
 
 long RemoteTransportConnection::acquireCount() { return g_acquireCount.load(std::memory_order_relaxed); }
