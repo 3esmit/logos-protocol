@@ -311,7 +311,42 @@ add_executable(protocol_tests
     # transport — the path a deferred "multi" completion event takes, and where the
     # refresh_balances onClientRead re-entrancy crash lived.
     test_remote_transport_events.cpp
+    # Freeing a dynamic replica that never reached Valid leaves QtRO holding it
+    # as a raw pointer (m_parentsNeedingConnect) and the implementation walks
+    # that list when the source finally publishes. requestObject()'s timeout
+    # branch did exactly that; it killed the json_rpc_bridge host whenever
+    # storage_module came back after a wedge.
+    #
+    # Its two crash cases are DETECTORS, validated on the pre-fix tree dcf4f05:
+    # SIGSEGV 5/5 runs, with the production reports' stack. The third case,
+    # ParksExactlyOneFacade, is a GUARD on the bound rather than on the crash --
+    # it cannot run on dcf4f05 because it asserts through a hook the fix adds, so
+    # it was validated against the park-WITHOUT-reuse mechanism instead (a
+    # throwaway edit making takeParked() return nullptr): it reports 8 parked
+    # facades for 8 attempts, and 8 still parked after recovery.
+    test_unconfigured_replica_lifetime.cpp
     test_deferred_subscription.cpp
+    # The other half of deferred subscription: a provider that dies UNDER an
+    # already-armed subscription. It re-arms on the same node with the event
+    # helper still attached, so the stream resumed silently with a hole in it
+    # and nothing was even polling for the death. Pins the generation counter
+    # (visible to a plain lp_subscribe caller) and the LOST -> ARMED pair the
+    # client's status callback delivers, with a provider-stays-up control.
+    test_subscription_continuity.cpp
+    # The other half of continuity: a per-module restart policy. The
+    # load-bearing test is ManualStillArmsDeferred — manual must mean "do not
+    # RE-arm", never "do not arm", or every subscription taken during init()
+    # before its provider listens stops working.
+    test_subscription_restart_policy.cpp
+    # Provider swapped faster than the 1 s poll. Detectors: four RED on 9e29120 (and without bindToSource), the gate one RED without
+    # the helper's gate, the late-subscriber/rearm three RED on 4ceea79 (rearm also without its replay). Churn* is a control.
+    test_subscription_fast_restart.cpp
+    # A provider served over plain TCP/TLS that dies and returns on its port. Seven detectors, RED on 5e7d0ec and each
+    # with its mechanism removed (isValid, the redial, its 20 ms cap, its deadline); AHealthyConnection* is a control.
+    # AFirstConnect*/AConsumer* are RED while connectToHost() is unbounded, *WhileTheIoThreadIsHeld also without its own
+    # cap; the AConnectFromAnEventHandler* control is RED if connectToHost() waits on a dial from the io thread.
+    # ACallFromAnEventHandler* is RED while requestObject() waits on a dial from the io thread (363408d, 9abb6bf).
+    test_plain_provider_restart.cpp
     # Token caching: regression for the IPC token-rotation race that surfaced
     # on Linux when storage_ui issued back-to-back sync invokeRemoteMethod
     # calls. Pre-fix the client re-mints per call and the target's per-caller
@@ -319,6 +354,18 @@ add_executable(protocol_tests
     # rejected as unauthorized. Post-fix exactly one handshake fires per
     # (client, target) pair.
     test_token_cache.cpp
+    # Readiness-gated exchange: the token exchange used to ask "is the target there?"
+    # on capability_module's own budget while the call about to follow asked the same
+    # question on the caller's, much longer, one — so a module that had not finished
+    # publishing lost its grant to a wait its caller never agreed to. These pin the
+    # ORDER (wait, then mint) and both ways of getting it wrong: minting early costs a
+    # wasted unauthorized round, waiting twice is a fleet-wide latency regression.
+    test_readiness_gated_exchange.cpp
+    # The handshake negative cache: an absence is remembered only once the business object
+    # has PROVEN the module is up. A probe also misses when the module has not published
+    # yet, and nothing re-probes an entry — so caching that reason writes a merely-late
+    # module off for the life of the process.
+    test_handshake_negative_cache.cpp
     # Rejection-driven token re-exchange: when a provider rejects a call for a
     # stale/unrecognized token it returns the structured sentinel
     # (logos_rpc_status.h); the client drops the cached token, re-runs
@@ -339,6 +386,61 @@ add_executable(protocol_tests
     # without that control the isolated assertions would pass on a store that
     # never held the token in the first place.
     test_token_store_identity.cpp
+    # Module identity: name()/version() answered by the proxy from
+    # providerName()/providerVersion() for a provider whose own dispatch does
+    # not, so a legacy module gains them with no edit. Pins the two properties
+    # the design rests on -- the fallback runs only after dispatch returned
+    # "unknown method" (no silent shadowing), and the listing agrees with what
+    # is callable -- plus the auth gate, which introspection deliberately lacks.
+    test_module_identity.cpp
+    # The INBOUND token store. ModuleProxy::m_tokens is the proxy's own
+    # caller-keyed record, and it had ZERO production writers: every real
+    # authorization decision came out of TokenManager, which was then
+    # direction-mixed (outbound tokens keyed by callee sat in the same flat map
+    # as inbound ones keyed by caller; test_token_direction.cpp split it). Two
+    # detectors, one per mechanism —
+    # AnInformedTokenLandsInTheProxysOwnStore fails when informModuleToken does
+    # not record, AnAmbientTokenDoesNotAuthorizeAnIsolatedProxy fails when
+    # isAuthorized scans TokenManager::instance() instead of the proxy's own
+    # store — plus the composed production shape and four pins. All three
+    # detectors were run RED against the unfixed tree; the runs are recorded in
+    # the file.
+    test_inbound_token_store.cpp
+    # WHO is calling, resolved out of that same inbound record as a
+    # by-product of the authorization scan. Production of the caller
+    # DOCUMENT and its lifetime on the dispatching thread only — nothing
+    # in this repo delivers it into a module cdylib yet. Most of the file
+    # is about the cases that must REFUSE to name anyone; the outbound-token
+    # case is the one an obvious simplification would delete, and since the
+    # direction split it asserts a refusal to AUTHORIZE as well.
+    test_call_caller.cpp
+    # An isolated identity's OWN credential: the store is born empty, the host
+    # mints/registers/adopts, and both halves — no host anchor, and no lockout —
+    # are asserted against real ModuleProxy authorization. See the file header
+    # for the two neutered builds that make each half a detector.
+    test_consumer_credential.cpp
+    # DIRECTION: outbound vs inbound in one store. The detector for the split,
+    # and the pins that say what the split must not break. Three of its
+    # assertions also detect whether logos-plugin-qt's companion one-line move
+    # (informModuleToken -> saveInboundToken) has landed; see the note on
+    # DirectionProvider.
+    test_token_direction.cpp
+    # THE LAYOUT of TokenManager, measured on a live object. The store split
+    # shipped as three members, which moved m_mutex from +24 to +56 on an object
+    # the HOST allocates and MODULE images mutate through their own statically
+    # linked copy of these accessors. Mixing a host and a module .lgx built
+    # either side of that deadlocked the module's host process on the first
+    # inbound token push -- silently, with the daemon still reporting
+    # "loaded"/"crashed":0, because the only load gate compares MAJOR. Direction
+    # is now a KEY NAMESPACE inside the original single QHash; these tests are
+    # what keep it that way, and they are RED on e514c53.
+    test_token_manager_abi.cpp
+    # THE INBOUND DOOR across the C ABI (lp_token_save_inbound, protocol 0.8),
+    # and the token-registry carve-out that keeps capability_module's roster
+    # alive. Every case names the one-line neutering that turns it red; two of
+    # them detect the original bug (a caller's token filed as an outbound
+    # credential) and two detect its fleet-fatal overcorrection.
+    test_inbound_door.cpp
     # test_plain_transport_tcp.cpp — entirely #if 0 (see the note inside:
     # in-process Qt-event-loop deadlock between consumer + provider under
     # nix's test sandbox; exercised cross-process by the integration matrix).

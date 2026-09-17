@@ -14,6 +14,8 @@
 #include <QMetaType>
 #include <QPointer>
 #include <string>
+#include <QElapsedTimer>
+#include <QTimer>
 
 using logos::qvariantToNlohmann;
 using logos::nlohmannArgsToQVariantList;
@@ -175,8 +177,37 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
 
     const QString tokenKey = tokenKeyFor(objectName);
     QString token = getToken(objectName);
-    if (token.isEmpty() && eligible)
-        token = mintAndCacheToken(objectName, timeout);   // first exchange (cached for later calls)
+    if (token.isEmpty() && eligible) {
+        // ORDER, not speed. The exchange asks "is the target there?" on
+        // capability_module's own budget while the call below asks the SAME question on
+        // this caller's — so the short wait gated the long one, and a module that had not
+        // finished publishing lost its grant to a wait its caller had never agreed to.
+        // Wait first, on the budget the caller consented to, then mint against a target
+        // that is provably up. Free: the handle stays in the consumer's cache, so the
+        // acquire inside invokeRemoteMethod below is a hit, not a second wait.
+        QElapsedTimer clock;
+        clock.start();
+        if (!m_consumer->ensureTargetAcquirable(objectName, timeout.ms)) {
+            // Return rather than fall through: invokeRemoteMethod would spend this same
+            // budget again on this thread, clear `err` on entry, and reach the identical
+            // answer. Falling through is what would make this change a latency regression.
+            if (err) {
+                err->code    = "object_unavailable";
+                err->message = "failed to acquire remote object '"
+                             + objectName.toStdString()
+                             + "' (module not loaded, not published, or transport failure)";
+                err->origin  = objectName.toStdString();
+            }
+            return QVariant();
+        }
+        // Re-read: the wait above spins QtRO's nested event loop, so the emptiness decided
+        // before it is stale. A re-entrant frame may already have minted, and a second mint
+        // OVERWRITES that token at the target and rejects its in-flight call.
+        token = getToken(objectName);
+        if (token.isEmpty())
+            token = mintAndCacheToken(
+                objectName, Timeout(qMax(1, timeout.ms - int(clock.elapsed()))));
+    }
 
     QVariant result = m_consumer->invokeRemoteMethod(token, objectName, methodName, args, timeout, err);
 
@@ -186,6 +217,8 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
     // loop, can't misfire on a legitimately-empty return, and never fires against
     // an old provider (which returns a bare QVariant() we don't match). This also
     // lazily recovers the common provider-reload case. See logos_rpc_status.h.
+    // Deliberately NOT gated on the acquire above: a sentinel is proof the target
+    // answered, so there is no readiness question left to ask.
     if (eligible && logos::isUnauthorizedSentinel(result)) {
         qWarning() << "LogosAPIClient: token for" << objectName
                    << "rejected by provider; re-exchanging and retrying once";
@@ -221,6 +254,31 @@ QString LogosAPIClient::mintAndCacheToken(const QString& objectName, Timeout tim
                               : QStringLiteral("requestModule"))
              << "for" << objectName;
     const QString capabilityToken = getToken(QStringLiteral("capability_module"));
+
+    // A NAMED DIAGNOSTIC for the one way this whole path fails silently.
+    //
+    // A private token store is created empty; the host is what puts the
+    // identity's own credential in it. A host that isolates an identity and
+    // never adopts a credential for it produces an empty capability token here,
+    // which ModuleProxy::authorize refuses at its empty-token check — so
+    // requestModule returns "", the real call goes out with no token, the one
+    // re-exchange fails identically, and the caller sees an empty QVariant. That
+    // reads as "the target returned nothing", which is the wrong bug to chase.
+    //
+    // Warned once per client rather than per call: the failure repeats on every
+    // call and the message is about the host's wiring, not about this call.
+    // Only for an ISOLATED store — the ambient ring legitimately starts without
+    // a capability token in plenty of tests and single-module processes.
+    if (capabilityToken.isEmpty() && m_token_manager
+        && m_token_manager != &TokenManager::instance() && !m_warnedNoCredential) {
+        m_warnedNoCredential = true;
+        qWarning() << "LogosAPIClient: identity" << m_origin_module
+                   << "has an isolated token store with no credential, so its"
+                      " requestModule handshake for" << objectName
+                   << "will be refused. The host must admit this identity"
+                      " (logos::admitConsumer / TokenManager::adoptCredentialFor)"
+                      " before it can call anything.";
+    }
     QString token;
     if (scopedTarget) {
         const QVariant result = m_capability_consumer->invokeRemoteMethod(
@@ -237,12 +295,16 @@ QString LogosAPIClient::mintAndCacheToken(const QString& objectName, Timeout tim
                                                  objectName.toStdString(),
                                                  timeout.ms));
     }
-    qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":"
-             << redactToken(token);
+    qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":" << redactToken(token);
     // Cache the minted token so subsequent calls skip the handshake — closes the
     // token-rotation race where overlapping requestModule calls mint fresh tokens
     // that overwrite each other at the target (e.g. QtRO's sync wait reentering
     // via a nested event loop).
+    //
+    // saveToken == the OUTBOUND half, keyed by the CALLEE. It used to be one map
+    // with the inbound tokens, so this write also authorized `objectName` to
+    // call US and an inbound push for the same peer clobbered this cache. Both
+    // are closed; see the DIRECTION note in token_manager.h.
     if (!token.isEmpty())
         m_token_manager->saveToken(tokenKey, token);
     return token;
@@ -394,55 +456,134 @@ void LogosAPIClient::invokeRemoteMethodAsyncImpl(const QString& objectName, cons
         // thread, reached above, so no lock is needed.
         m_pendingHandshakes[tokenKey].push_back(
             [this, objectName, methodName, args, timeout, cb = std::move(onResult)]
-            (const QString& tok) mutable {
+            (const QString& tok, bool reachable) mutable {
+                if (!reachable) {
+                    // Do NOT dispatch. invokeRemoteMethodAsync's first act is a BLOCKING
+                    // acquireCachedObject on this thread, so dispatching into a target we
+                    // already know is absent would pay the caller's budget a second time,
+                    // on the owner (GUI) thread.
+                    logos::CallError e;
+                    e.code    = "object_unavailable";
+                    e.message = "failed to acquire remote object '" + objectName.toStdString()
+                              + "' (module not loaded, not published, or transport failure)";
+                    e.origin  = objectName.toStdString();
+                    cb(QVariant(), e);
+                    return;
+                }
                 m_consumer->invokeRemoteMethodAsync(tok, objectName, methodName, args,
                                                     std::move(cb), timeout);
             });
         if (m_pendingHandshakes[tokenKey].size() > 1)
             return;  // a handshake for this target is already in flight
 
-        const QString capabilityToken = getToken("capability_module");
-        const QString origin = m_origin_module;
-        const bool scopedTarget = !m_target_instance_id.isEmpty()
-            && objectName != QStringLiteral("capability_module");
-        const QString capabilityMethod = scopedTarget
-            ? QStringLiteral("requestModuleScoped")
-            : QStringLiteral("requestModule");
-        QVariantList capabilityArgs;
-        capabilityArgs << origin << objectName;
-        if (scopedTarget)
-            capabilityArgs << m_target_instance_id;
-        // Lifetime: capture the client through a QPointer guard. If it (and its
-        // QObject-parented consumers + the pending queue) is destroyed while the
-        // requestModule round-trip is in flight, the guard goes null and we drop
-        // the queued continuations instead of dereferencing dangling memory.
-        QPointer<LogosAPIClient> self(this);
-        m_capability_consumer->invokeRemoteMethodAsync(
-            capabilityToken,
-            QStringLiteral("capability_module"),
-            capabilityMethod,
-            capabilityArgs,
-            [self, tokenKey](const QVariant& tokenResult) mutable {
-                if (!self) return;  // client destroyed mid-flight
-                const QString tok = tokenResult.toString();
-                // Cache the minted token before draining so future calls skip the handshake — m_pendingHandshakes only coalesces the first burst, the cache stops a second burst from racing the same rotation.
-                if (!tok.isEmpty()) self->m_token_manager->saveToken(tokenKey, tok);
-                // Drain every continuation queued for this target with the one
-                // minted token — the target was informed of exactly this token.
-                // An empty tok (handshake failed) still flows through: the
-                // consumer call is then rejected and each callback fires with an
-                // invalid QVariant, so callers never hang.
-                auto it = self->m_pendingHandshakes.find(tokenKey);
-                if (it == self->m_pendingHandshakes.end()) return;
-                std::vector<std::function<void(const QString&)>> calls = std::move(it.value());
-                self->m_pendingHandshakes.erase(it);
-                for (auto& c : calls) c(tok);
-            },
-            timeout);
+        beginReadinessGatedHandshake(objectName, timeout);
         return;
+
     }
 
     m_consumer->invokeRemoteMethodAsync(token, objectName, methodName, args, std::move(onResult), timeout);
+}
+
+
+void LogosAPIClient::beginReadinessGatedHandshake(const QString& objectName, Timeout timeout)
+{
+    // The async twin of the sync reorder, expressed with the deferral the registry already
+    // provides so nothing blocks. Modelled on LogosQmlBridge::callModuleAsync, including
+    // the single `done` latch — that discipline is load-bearing, not incidental.
+    auto rec = std::make_shared<PendingReadiness>();
+    m_pendingReadiness.insert(objectName, rec);
+
+    QPointer<LogosAPIClient> self(this);
+    // whenObjectAvailable ARMS SYNCHRONOUSLY when the object is already there, so this can
+    // run before the call returns. Everything it needs lives in `rec`, which exists first;
+    // id and timer are written after, and only if it has not already fired.
+    const quint64 id = m_consumer->whenObjectAvailable(objectName,
+        [self, objectName, rec, timeout](bool ready) mutable {
+            if (rec->done) return;
+            rec->done = true;
+            if (!self) return;
+            self->finishReadiness(objectName);   // retire the deadline BEFORE dispatching
+            if (ready) self->startCapabilityHandshake(objectName, timeout);
+            else       self->drainPendingHandshakes(objectName, QString(), false);
+        });
+
+    if (rec->done) return;                       // fired synchronously
+    if (id == 0) {                               // refused: answer now, never hang
+        rec->done = true;
+        m_pendingReadiness.remove(objectName);
+        drainPendingHandshakes(objectName, QString(), false);
+        return;
+    }
+    rec->id = id;
+    // whenObjectAvailable never fires for an object that never appears, and the queued
+    // continuations owe their callers an answer. This timer is the only thing that
+    // guarantees one.
+    rec->timer = new QTimer(this);
+    rec->timer->setSingleShot(true);
+    connect(rec->timer, &QTimer::timeout, this, [self, objectName, rec]() mutable {
+        if (rec->done) return;
+        rec->done = true;
+        if (!self) return;
+        self->m_consumer->cancelEventSubscription(rec->id);
+        self->finishReadiness(objectName);
+        self->drainPendingHandshakes(objectName, QString(), false);
+    });
+    rec->timer->start(qMax(1, timeout.ms));
+}
+
+void LogosAPIClient::finishReadiness(const QString& objectName)
+{
+    auto it = m_pendingReadiness.find(objectName);
+    if (it == m_pendingReadiness.end()) return;
+    // deleteLater, never delete: this can run from the timer's own slot.
+    if ((*it)->timer) {
+        (*it)->timer->stop();
+        (*it)->timer->deleteLater();
+        (*it)->timer = nullptr;
+    }
+    m_pendingReadiness.erase(it);
+}
+
+void LogosAPIClient::drainPendingHandshakes(const QString& objectName,
+                                            const QString& token, bool targetReachable)
+{
+    auto it = m_pendingHandshakes.find(tokenKeyFor(objectName));
+    if (it == m_pendingHandshakes.end()) return;
+    auto calls = std::move(it.value());
+    m_pendingHandshakes.erase(it);                    // erase BEFORE running: a
+    for (auto& c : calls) c(token, targetReachable);  // continuation may re-enqueue
+}
+
+void LogosAPIClient::startCapabilityHandshake(const QString& objectName, Timeout timeout)
+{
+    const QString tokenKey = tokenKeyFor(objectName);
+    const bool scopedTarget = !m_target_instance_id.isEmpty()
+        && objectName != QStringLiteral("capability_module");
+    const QString capabilityToken = getToken("capability_module");
+    const QString origin = m_origin_module;
+    // Lifetime: capture the client through a QPointer guard. If it (and its
+    // QObject-parented consumers + the pending queue) is destroyed while the
+    // requestModule round-trip is in flight, the guard goes null and we drop
+    // the queued continuations instead of dereferencing dangling memory.
+    QPointer<LogosAPIClient> self(this);
+    m_capability_consumer->invokeRemoteMethodAsync(
+        capabilityToken,
+        QStringLiteral("capability_module"),
+        scopedTarget ? QStringLiteral("requestModuleScoped")
+                     : QStringLiteral("requestModule"),
+        scopedTarget ? (QVariantList() << origin << objectName << m_target_instance_id)
+                     : (QVariantList() << origin << objectName),
+        [self, objectName, tokenKey](const QVariant& tokenResult) mutable {
+            if (!self) return;  // client destroyed mid-flight
+            const QString tok = tokenResult.toString();
+            // Cache the minted token before draining so future calls skip the
+            // handshake entirely.
+            if (!tok.isEmpty()) self->m_token_manager->saveToken(tokenKey, tok);
+            // An empty tok still drains as REACHABLE: the gate proved the target is up,
+            // so the call is worth making and its own rejection is the honest answer.
+            self->drainPendingHandshakes(objectName, tok, /*targetReachable=*/true);
+        },
+        timeout);
 }
 
 void LogosAPIClient::invokeRemoteMethodAsync(const QString& objectName, const QString& methodName,
@@ -528,6 +669,46 @@ LogosSubscriptionState LogosAPIClient::eventSubscriptionState(quint64 subscripti
     });
 }
 
+void LogosAPIClient::setSubscriptionStatusCallback(
+    const QString& objectName,
+    std::function<void(LogosSubscriptionEvent, quint64, const QString&)> onStatus)
+{
+    if (!m_consumer) return;
+    // Same owner-thread marshalling as onEventWhenAvailable, and not only for
+    // symmetry: installing replays the current state, which can run the
+    // caller's callback on whichever thread installed it unless this hops
+    // first.
+    logos::runOnOwnerThread(this, [&]() {
+        m_consumer->setSubscriptionStatusCallback(objectName, std::move(onStatus));
+    });
+}
+
+quint64 LogosAPIClient::subscriptionGeneration(const QString& objectName) const
+{
+    if (!m_consumer) return 0;
+    auto* self = const_cast<LogosAPIClient*>(this);
+    return logos::runOnOwnerThread(self, [&]() -> quint64 {
+        return m_consumer->subscriptionGeneration(objectName);
+    });
+}
+
+void LogosAPIClient::setSubscriptionRestartPolicy(const QString& objectName,
+                                                  LogosRestartPolicy policy)
+{
+    if (!m_consumer) return;
+    logos::runOnOwnerThread(this, [&]() {
+        m_consumer->setSubscriptionRestartPolicy(objectName, policy);
+    });
+}
+
+bool LogosAPIClient::rearmSubscriptions(const QString& objectName)
+{
+    if (!m_consumer) return false;
+    return logos::runOnOwnerThread(this, [&]() -> bool {
+        return m_consumer->rearmSubscriptions(objectName);
+    });
+}
+
 QStringList LogosAPIClient::pendingEventSubscriptions() const
 {
     return logos::runOnOwnerThread(const_cast<LogosAPIClient*>(this), [&]() -> QStringList {
@@ -574,9 +755,10 @@ void LogosAPIClient::onEventResponse(QObject* object, const QString& eventName, 
 
 bool LogosAPIClient::informModuleToken(const QString& authToken, const QString& moduleName, const QString& token)
 {
-    // Token delivery acquires a transport replica, so it must use the same
-    // owner-thread boundary as other synchronous consumer operations.
-    return logos::runOnOwnerThread(this, [&]() {
+    // Marshal to the owner thread, as requestObject does. The handle here is
+    // uncached, which is not the same as thread-agnostic: it is still acquired
+    // from — and released back to — the owner's node.
+    return logos::runOnOwnerThread(this, [&]() -> bool {
         return m_consumer->informModuleToken(authToken, moduleName, token);
     });
 }
@@ -590,10 +772,11 @@ bool LogosAPIClient::informModuleToken(const std::string& authToken, const std::
 
 bool LogosAPIClient::informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs)
 {
-    // The origin-module variant also acquires a transport replica.
-    return logos::runOnOwnerThread(this, [&]() {
-        return m_consumer->informModuleToken_module(authToken, originModule,
-                                                     moduleName, token, timeoutMs);
+    // Marshal to the owner thread, exactly as requestObject/invokeRemoteMethod do.
+    // This path goes through acquireCachedObject, so it also reads and mutates
+    // m_objectCache — single-threaded, and holding thread-affine QtRO handles.
+    return logos::runOnOwnerThread(this, [&]() -> bool {
+        return m_consumer->informModuleToken_module(authToken, originModule, moduleName, token, timeoutMs);
     });
 }
 
@@ -612,9 +795,6 @@ bool LogosAPIClient::informModuleTokenScoped(const QString& authToken,
             authToken,
             QStringLiteral("capability_module"),
             QStringLiteral("informModuleTokenScoped"),
-            // Generic dispatch only proves that the caller has some issued token.
-            // The capability provider must additionally verify that this is its
-            // trusted core/capability channel before accepting a bootstrap token.
             QVariantList() << authToken << moduleName << instanceId << token,
             Timeout());
         return result.toBool();

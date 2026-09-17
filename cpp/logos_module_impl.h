@@ -81,10 +81,54 @@ LOGOS_MODULE_IMPL_EXPORT void logos_module_set_context(
 LOGOS_MODULE_IMPL_EXPORT void logos_module_set_emit_callback(
     logos_module_emit_cb cb, void* user_data);
 
-/* Deliver an auth token for `module_name` (the provider-side
- * informModuleToken). Returns 0 on acceptance. */
+/* THE OUTBOUND DOOR. Deliver the token this module will PRESENT when it CALLS
+ * `module_name`. Returns 0 on acceptance.
+ *
+ * ONE MEANING ONLY, and that is the change: the glue used to call this from two
+ * places with two opposite meanings -- seeding the module's own anchor in
+ * onInit (outbound, correct) and forwarding a CALLER's token from
+ * informModuleToken (inbound, filed as an outbound credential). The second
+ * write is what let a module present, to a peer, the very token that peer had
+ * been issued to call IT -- the direction collision, one image deeper than the
+ * one ModuleProxy::authorize sees. The caller path now goes through
+ * logos_module_accept_inbound_token below; this one is the anchor seeding and
+ * nothing else. Do not merge them back together. */
 LOGOS_MODULE_IMPL_EXPORT int logos_module_accept_token(const char* module_name,
                                                        const char* token);
+
+/* THE INBOUND DOOR. Record that `caller` may present `token` when it calls THIS
+ * module. Returns 0 on acceptance.
+ *
+ * WHY IT IS A SECOND SYMBOL RATHER THAN A FLAG ON THE FIRST. A parameter is a
+ * value a caller can get wrong, and default; a separate name either resolves or
+ * does not. The two doors write two disjoint key namespaces in the image's
+ * TokenManager (logos-protocol cpp/token_manager.h), and nothing reachable from
+ * one can read the other -- which is the property that makes a grant one way
+ * stop being a grant the other way.
+ *
+ * WHAT A TOKEN REGISTRY GETS INSTEAD, said here because it is the one thing
+ * about this door that surprises. To an ordinary provider `informModuleToken`
+ * means "this caller may call you". To the module holding the token registry
+ * (capability_module) the SAME wire message means "here is module X's token,
+ * present it when you call X" -- outbound. So lp_token_save_inbound, which this
+ * forwards to, ALSO writes the outbound half when, and only when, the image has
+ * been granted the "token_registry" host service. Without that carve-out
+ * capability_module's roster (lp_token_keys) empties and every requestModule in
+ * the fleet is refused with "rejecting request from unknown module identity".
+ * The grant is the declaration of the role, so the role decides -- see
+ * lp_token_save_inbound in logos_protocol.h.
+ *
+ * CONDITIONAL on protocol >= 0.8, with the same teeth as every other entry
+ * here: the glue emits a DIRECT call, so a module generated for >= 0.8 whose
+ * backend omits this definition links cleanly and then fails at dlopen() on
+ * ELF with "undefined symbol" -- invisible on macOS. Both backends
+ * (logos-cpp-sdk's lidl_gen_cdylib.cpp and logos-rust-sdk's
+ * rustgen_provider.rs) owe it in the SAME WAVE as this declaration.
+ * nix/module-impl-abi.nix is what makes that fail in CI instead of at a user's
+ * dlopen -- but only after each backend bumps its logos-protocol lock, which is
+ * the real lag to watch. */
+LOGOS_MODULE_IMPL_EXPORT int logos_module_accept_inbound_token(const char* caller,
+                                                               const char* token);
 
 /* Grant the module the privileged host services named in `services_json` (a
  * JSON array from the closed set lp_grant_host_services documents). Returns 0
@@ -103,6 +147,145 @@ LOGOS_MODULE_IMPL_EXPORT int logos_module_accept_token(const char* module_name,
  * takes — is what puts the grant in the image whose gates it must open. */
 LOGOS_MODULE_IMPL_EXPORT int logos_module_grant_host_services(
     const char* services_json);
+
+/* Teardown completion callback, installed by the glue before it asks the module
+ * to unload. May be invoked from any module thread. */
+typedef void (*logos_module_unload_done_cb)(void* user_data);
+
+/* Install the teardown-completion callback. Called before
+ * logos_module_about_to_unload(); a NULL cb clears it. */
+LOGOS_MODULE_IMPL_EXPORT void logos_module_set_unload_done_callback(
+    logos_module_unload_done_cb cb, void* user_data);
+
+/* Ask the module to prepare for teardown. Returns 0 when it is already
+ * quiescent, 1 when it has work to finish and will invoke the callback
+ * installed above exactly once when done.
+ *
+ * The wait is BOUNDED by the host: returning 1 buys a grace period, not a veto.
+ * A module that never signals delays every teardown by that period and is torn
+ * down anyway, so the deadline is real rather than a courtesy.
+ *
+ * CONDITIONAL on the protocol version, which is not the same as optional at
+ * load time. The glue emits a DIRECT call — no dlsym, no null check — so a
+ * module generated for >= 0.5 whose backend omits the definition links cleanly
+ * and then fails at dlopen(), on ELF, with "undefined symbol". The pair is
+ * skippable only where the CALLER was generated below 0.5 and emitted no call.
+ *
+ * An earlier version of this comment argued the arrangement was safe because
+ * "the glue is generated alongside the module". That does not follow, and the
+ * ABI has now been broken twice on the strength of it. Being generated in the
+ * same build makes the two agree on the protocol VERSION; it says nothing about
+ * which SYMBOLS a given language backend's emitter writes for that version,
+ * because each backend implements this ABI independently. Both breakages —
+ * grant_host_services at 0.3 and this pair at 0.5 — happened at perfect version
+ * agreement, and both were invisible on macOS (plugins link
+ * -undefined dynamic_lookup) and fatal on Linux (nixpkgs' -Wl,-z,now binds
+ * eagerly).
+ *
+ * So every backend owes a build-time check that its generated scaffold defines
+ * everything declared here. nix/module-impl-abi.nix publishes this file's
+ * export list as data for exactly that purpose. */
+LOGOS_MODULE_IMPL_EXPORT int logos_module_about_to_unload(void);
+
+/* ---------------------------------------------------------------------------
+ * THE CALLER OF A DISPATCH.
+ *
+ * Push the identity of whoever is making the call that is about to run
+ * (`caller_json` non-NULL), or pop it (`caller_json` NULL). The glue wraps
+ * exactly one logos_module_dispatch() in one push/pop pair, on the thread that
+ * dispatch runs on; the module's language binding surfaces the innermost value
+ * to the handler as an AMBIENT accessor — logos::currentCaller() in C++,
+ * logos_rust_sdk::current_caller() in Rust.
+ *
+ * NOT A LIDL PARAMETER, and that is a requirement rather than an implementation
+ * detail. Who is calling is not part of a module's interface: the callee already
+ * possesses that identity, because the caller had to present a token this module
+ * itself issued in order to get here at all. This ABI only surfaces what
+ * authorization already established. Nothing about it is per-method, opt-in, or
+ * visible in a .lidl file.
+ *
+ * A PER-THREAD STACK, not a single slot. A handler that makes an outbound call
+ * spins a nested event loop, and a second inbound call can be delivered on the
+ * same thread inside it; a plain set/clear pair would have the inner call's pop
+ * erase the outer call's caller. So: non-NULL pushes, NULL pops the innermost,
+ * a pop with nothing pushed is a no-op, and each thread has its own stack. One
+ * symbol, because one symbol is what the export list checks for.
+ *
+ * VALID ONLY DURING A DISPATCH, ON THE DISPATCHING THREAD. A worker the module
+ * spawned, a timer callback, a context-ready hook and an event emission all read
+ * Unknown — correctly, since none of them has a caller. A handler that needs the
+ * identity beyond its own frame copies it at the top.
+ *
+ * ── THE DOCUMENT ────────────────────────────────────────────────────────────
+ *
+ * `caller_json` is a JSON OBJECT. This is its normative definition; the C++ and
+ * Rust types that parse it are per-language, exactly as the {"_bytes":...} form
+ * and the {"code","message","origin"} error object are.
+ *
+ *   {"kind":"unknown"}
+ *   {"kind":"host"}
+ *   {"kind":"module","name":"chat_module"}
+ *   {"kind":"module","name":"chat_module","instance":"a41f"}
+ *   {"kind":"derived","parent":"wallet_module","leaf":"wallet_ui"}
+ *   {"kind":"operator","name":"ops-readonly"}
+ *
+ * Rules, in the order a reader applies them:
+ *
+ *   1. "kind" is MANDATORY. Missing, non-string, an unparseable document, or
+ *      empty input ⇒ unknown.
+ *   2. An UNRECOGNISED "kind" ⇒ unknown. Never a closest match, never dropped.
+ *      This is the only safe direction: adding an arm can turn an old reader's
+ *      is_module(x) from true to false, never the reverse. A permissive fallback
+ *      would do the opposite and silently WIDEN a predicate that sits next to
+ *      authorization decisions.
+ *   3. Unrecognised FIELDS inside a known arm are ignored, so an arm can gain a
+ *      field without a version bump.
+ *   4. A known arm missing a required field ⇒ unknown, not a partial value.
+ *   5. "host" carries NO name and must not gain one. "core" and
+ *      "capability_module" hold the same token VALUE under two keys by
+ *      construction, so a name there would be a coin flip presented as a fact.
+ *   6. "instance" is optional FROM DAY ONE and is_module(name) deliberately
+ *      ignores it. The draft spec's authenticated invoker is a module instance
+ *      address rather than a bare name; shipping the field later would have
+ *      silently reinterpreted every call site the moment instance addressing
+ *      arrived. A caller that must distinguish instances compares the full
+ *      identity.
+ *
+ *      An "instance" that is PRESENT but not a string is DROPPED, and the
+ *      module is still identified by its name. This is normative because the
+ *      two backends disagreed about it — C++ dropped it, Rust returned
+ *      "unknown" — each with a passing test pinning its own answer, so neither
+ *      suite could see the divergence. The rule is decided here rather than in
+ *      either of them.
+ *
+ *      Dropping is the correct arm on two grounds. "name" comes from the host's
+ *      own token resolution and is not made less trustworthy by a malformed
+ *      sibling field; and is_module(name), which is the path essentially every
+ *      caller takes, ignores "instance" entirely. Failing the whole identity
+ *      would turn a cosmetic wire defect into a fleet-wide authorization change,
+ *      and would mean a later protocol emitting a richer "instance" silently
+ *      stops one language's modules recognising callers the other still does.
+ *      A backend that needs the distinction reads the field itself.
+ *
+ * Nothing here is spelled "verified". capability_module checks only that an
+ * asserted name EXISTS as a key, so the strongest honest word for a named module
+ * is token-bound.
+ *
+ * PRODUCERS TODAY: "unknown", "host", and "module" WITHOUT "instance". The
+ * "derived" and "operator" arms are specified and must be parsed, but nothing
+ * emits them yet — said here rather than left for someone to discover.
+ * "derived" is reserved for the isolated per-plugin identity
+ * (LogosAPI::forIdentity); "operator" needs ModuleProxy::TokenValidator widened
+ * from bool to also yield a name, which is a logos-logoscore-cli change.
+ *
+ * CONDITIONAL on protocol >= 0.6, with the same teeth as the teardown pair
+ * above: the glue emits a DIRECT call, so a module generated for >= 0.6 whose
+ * backend omits this definition links cleanly and then fails at dlopen() on ELF
+ * with "undefined symbol". Both backends owe it in the same wave as this
+ * declaration; nix/module-impl-abi.nix is what makes that fail loudly instead
+ * of at a user's dlopen.
+ * ------------------------------------------------------------------------- */
+LOGOS_MODULE_IMPL_EXPORT void logos_module_set_call_caller(const char* caller_json);
 
 /* The logos-protocol semver this module was compiled against. Static
  * string — do NOT free. */

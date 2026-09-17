@@ -18,7 +18,10 @@
 #include "logos_transport_config.h"
 #include <nlohmann/json.hpp>
 
+#include <memory>
+
 class LogosAPI;
+class QTimer;
 class LogosAPIConsumer;
 class LogosObject;
 class TokenManager;
@@ -125,11 +128,11 @@ public:
      * @brief invokeRemoteMethod with an explicit error out-channel.
      *
      * Fills *err with the canonical {code, message, origin} call error when
-     * the failure is detectable: "object_unavailable" when the target object
-     * cannot be acquired, or "invoke_failed" when the target provider throws;
-     * cleared on success. Generated typed client wrappers call this overload
-     * and throw logos::LogosCallError so callers can distinguish a failed call
-     * from a legitimately default-valued result.
+     * the failure is detectable (today: "object_unavailable" when the target
+     * object cannot be acquired); cleared on success. Generated typed client
+     * wrappers call this overload and throw logos::LogosCallError so callers
+     * can distinguish a failed call from a legitimately default-valued
+     * result.
      */
     QVariant invokeRemoteMethod(const QString& objectName, const QString& methodName,
                              const QVariantList& args, Timeout timeout, logos::CallError* err);
@@ -239,10 +242,9 @@ public:
      * @brief Async callback with an explicit error out-channel.
      *
      * Mirrors the sync `invokeRemoteMethod(..., CallError*)` overload. Set to
-     * code="object_unavailable" when the target object cannot be acquired or
-     * code="invoke_failed" when the target provider throws; cleared on
-     * success. Callers that need to distinguish failures from a legitimately
-     * empty QVariant result should use this overload.
+     * code="object_unavailable" when the target object cannot be acquired,
+     * cleared on success. Callers that need to distinguish acquire failure
+     * from a legitimately empty QVariant result should use this overload.
      */
     using AsyncResultErrorCallback = std::function<void(QVariant, const logos::CallError&)>;
 
@@ -354,6 +356,34 @@ public:
     LogosSubscriptionState eventSubscriptionState(quint64 subscriptionId) const;
 
     /**
+     * @brief Watch a target module's subscription transitions. See
+     *        LogosAPIConsumer::setSubscriptionStatusCallback for the contract.
+     *
+     * Keyed by module, not by subscription: every subscription to a module
+     * hangs off one handle, so they are lost and re-established together.
+     */
+    void setSubscriptionStatusCallback(
+        const QString& objectName,
+        std::function<void(LogosSubscriptionEvent, quint64 generation,
+                           const QString& reason)> onStatus);
+
+    /**
+     * @brief Which establishment a module's subscriptions are on.
+     *        See LogosAPIConsumer::subscriptionGeneration.
+     */
+    quint64 subscriptionGeneration(const QString& objectName) const;
+
+    /**
+     * @brief Choose what happens when a module's provider goes away. See
+     *        LogosAPIConsumer::setSubscriptionRestartPolicy — in particular
+     *        that it does NOT affect the first arm.
+     */
+    void setSubscriptionRestartPolicy(const QString& objectName, LogosRestartPolicy policy);
+
+    /** @brief Revive a module's Held subscriptions. See LogosAPIConsumer::rearmSubscriptions. */
+    bool rearmSubscriptions(const QString& objectName);
+
+    /**
      * @brief Diagnostics: "<object>::<event>" for every deferred subscription
      *        that has not armed yet.
      */
@@ -382,16 +412,18 @@ public:
     bool informModuleToken_module(const QString& authToken, const QString& originModule, const QString& moduleName, const QString& token, int timeoutMs = 20000);
 
     // Register a bootstrap token for one explicit target instance with an
-    // instance-aware capability module. The trusted auth token is sent both
-    // in the RPC envelope and to the provider for its privileged-channel
-    // check. Scoped callers deliberately do not downgrade to the name-only
-    // registration path.
+    // instance-aware capability module. Scoped callers deliberately do not
+    // downgrade to the name-only registration path.
     bool informModuleTokenScoped(const QString& authToken,
                                  const QString& moduleName,
                                  const QString& instanceId,
                                  const QString& token);
 
     TokenManager* getTokenManager() const;
+    // The OUTBOUND token for `module_name`: what this client presents when it
+    // CALLS `module_name`. Never a token some caller was issued to call US —
+    // that half of the store has no reader here, by construction (see the
+    // DIRECTION note in token_manager.h).
     QString getToken(const QString& module_name);
 
     // nlohmann::json overloads — args is a JSON array, result is a JSON value.
@@ -429,6 +461,15 @@ private:
                                      const QVariantList& args, AsyncResultErrorCallback callback,
                                      Timeout timeout, int retriesLeft);
 
+    // The async twin of the sync readiness gate. Same rule — wait for the target on the
+    // CALLER's budget, then mint against a target that is provably up — expressed with the
+    // deferral the consumer already provides, so nothing blocks the owner thread.
+    void beginReadinessGatedHandshake(const QString& objectName, Timeout timeout);
+    void startCapabilityHandshake(const QString& objectName, Timeout timeout);
+    void drainPendingHandshakes(const QString& objectName, const QString& token,
+                                bool targetReachable);
+    void finishReadiness(const QString& objectName);
+
     // ABI note: this private layout is consumed by every plugin that
     // statically links libsdk. Adding a new field in the middle of
     // this section shifts the offsets of subsequent fields and
@@ -461,7 +502,22 @@ private:
     // owner thread (invokeRemoteMethodAsync marshals there), so it needs no
     // lock. Appended after the pre-existing ABI-sensitive layout; defaults to
     // empty.
-    QMap<QString, std::vector<std::function<void(const QString&)>>> m_pendingHandshakes;
+    // The bool is "the target is reachable". The queue is drained by exactly ONE of three
+    // edges — ready, deadline, or client destroyed — and never twice.
+    QMap<QString, std::vector<std::function<void(const QString&, bool)>>> m_pendingHandshakes;
+
+    // One-shot latch for the "isolated store with no credential" warning in
+    // mintAndCacheToken(). The condition repeats on every call and the message
+    // is about the HOST's wiring, so it is worth saying once and not N times.
+    // Appended last per the ABI note above; defaults to false.
+    bool m_warnedNoCredential = false;
+
+    // Per-target readiness wait guarding the async first exchange. `done` is the single
+    // latch: ready and deadline are mutually exclusive, so a deadline can never answer
+    // callers while an exchange is in flight and leave a token at the target that nobody
+    // holds. Appended last per the ABI note above.
+    struct PendingReadiness { quint64 id = 0; QTimer* timer = nullptr; bool done = false; };
+    QMap<QString, std::shared_ptr<PendingReadiness>> m_pendingReadiness;
 
     // Appended after every existing private member to preserve ABI layout for
     // statically linked consumers. It identifies the target endpoint only;

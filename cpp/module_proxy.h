@@ -10,11 +10,36 @@
 #include <QPointer>
 
 #include <functional>
+#include <string>
 #include <utility>
+
+#include "token_manager.h"
 
 class LogosProviderObject;
 
 namespace logos {
+
+/**
+ * @brief How many constant-time token comparisons this image has performed.
+ *
+ * INSTRUMENTATION, not a knob and not a diagnostic anyone should act on. It
+ * exists so a test can assert the one timing property that is deterministic
+ * enough to be worth asserting: the number of comparisons ModuleProxy performs
+ * for an inbound call is a function of the STORE SIZES only — never of where
+ * the matching token sits, nor of whether there was a match at all. An
+ * accidental `break` or early `return` in either scan loop is exactly what that
+ * catches, and is exactly what the constant-time compare exists to prevent.
+ *
+ * It asserts nothing about wall-clock time and no test here should claim it
+ * does; see the note in tests/protocol/test_inbound_token_store.cpp.
+ *
+ * Always on rather than behind a build flag: a relaxed atomic increment is
+ * unmeasurable next to the two heap allocations QString::toUtf8() already makes
+ * on every one of these comparisons, and a check that only exists in a test
+ * build is a check that stops matching the shipped code.
+ */
+unsigned long long tokenComparisonCount();
+
 // The name a module's handshake surface is published under.
 //
 // A module's initializer is synchronous and routinely calls out — including
@@ -59,7 +84,23 @@ public:
     using TokenValidator = std::function<bool(const QString& token,
                                               const QString& transportProtocol)>;
 
-    explicit ModuleProxy(LogosProviderObject* provider, QObject* parent = nullptr);
+    // `token_store` is the store this proxy AUTHORIZES AGAINST — specifically
+    // its INBOUND half and its CREDENTIAL; the outbound half is never consulted
+    // (TokenManager's DIRECTION note explains what that closed).
+    // It must be the same store the provider's own informModuleToken writes to,
+    // which for the Qt stack is LogosAPI::getTokenManager() ==
+    // TokenManager::forIdentity(<this module's name>), NOT the ambient
+    // instance(). Those are the same object until a host isolates the identity;
+    // after that they diverge and hardcoding instance() means two different
+    // failures at once — every token the host seeded privately is invisible
+    // (inbound calls rejected with no diagnostic), and every token in the
+    // ambient ring is still accepted (the escalation isolation exists to close).
+    //
+    // Defaulted to &TokenManager::instance() so every existing two-argument
+    // construction keeps scanning exactly what it scanned before. A null
+    // pointer means the same thing.
+    explicit ModuleProxy(LogosProviderObject* provider, QObject* parent = nullptr,
+                         TokenManager* token_store = nullptr);
     ~ModuleProxy();
 
     void setTokenValidator(TokenValidator validator);
@@ -89,15 +130,66 @@ signals:
     void eventResponse(const QString& eventName, const QVariantList& data);
 
 private:
-    // Returns true when authToken matches a token THIS module has issued (via
-    // saveToken / informModuleToken) OR the host-installed validator accepts it
-    // for `transportProtocol`. Empty/unknown tokens are rejected. The built-in
-    // comparison is constant-time and never early-outs, so neither a correct
-    // prefix nor the number of issued tokens leaks through timing.
+    // Returns true when authToken matches a token THIS module has been told
+    // about (via saveToken / informModuleToken), or one in the INBOUND half of
+    // this proxy's token store, or this identity's own credential, OR the
+    // host-installed validator accepts it for `transportProtocol`. The store's
+    // OUTBOUND half is deliberately not among them — see scanIssuedTokens().
+    // Empty/unknown tokens are rejected. The built-in comparison is constant-time
+    // and never early-outs, so neither a correct prefix nor the number of issued
+    // tokens leaks through timing.
+    //
+    // Kept as the two-argument spelling every existing call site and comment in
+    // the fleet names; it forwards to authorize() below with no caller-out.
     bool isAuthorized(const QString& authToken, const QString& transportProtocol) const;
 
+    // The same decision, PLUS who made it.
+    //
+    // Fused into one scan rather than added as a second pass, for two reasons
+    // and the second is the important one. It costs zero extra comparisons:
+    // deciding whether a presented token matches an issued one is already a walk
+    // over every issued token, and the key is right there. And it keeps the
+    // constant-time property in ONE place — a separate "now find the name" loop
+    // is a second scan whose early-out looks obviously harmless and would
+    // reintroduce, in three lines, exactly the leak constantTimeEquals exists to
+    // close.
+    //
+    // On `true`, *callerJson (when non-null) receives the caller document
+    // described in logos_caller_scope.h — always a valid document, never empty,
+    // Unknown where the caller cannot be named honestly. Untouched on `false`
+    // beyond the Unknown it is initialised to: an unauthorized call has no
+    // caller because it has no dispatch.
+    bool authorize(const QString& authToken, const QString& transportProtocol,
+                   std::string* callerJson) const;
+
     LogosProviderObject* m_provider;
+    // THE INBOUND STORE: caller name -> the token that caller may present to us.
+    // Direction-pure by construction — the only writers are saveToken() and
+    // informModuleToken(), both of which key by the CALLER — which is what makes
+    // it the only store here that can honestly NAME a caller.
+    //
+    // NOT the only inbound record any more, and still the only NAMING one.
+    // TokenManager now has an inbound half of its own (m_store->inbound()),
+    // written by the provider; authorize() scans it but takes no name from it,
+    // because in the Qt stack the same (caller, token) pair lands in both and
+    // folding both would make every ordinary caller ambiguous. See
+    // scanIssuedTokens() in module_proxy.cpp.
+    //
+    // Never reverse-look-up m_store's OUTBOUND half for a caller name — and
+    // note that authorize() is no longer given anything that could: the
+    // outbound map holds the token we will PRESENT to a callee, filed under the
+    // CALLEE's name (logos_api_client.cpp:201), so a hit there would name a
+    // module we CALL as the module CALLING us.
     QHash<QString, QString> m_tokens;
+    // Never null after construction; see the constructor comment.
+    //
+    // A new data member here is safe in a way one in LogosAPI is not (see the
+    // warning at logos_api.h:329). Nothing hands a ModuleProxy across an image
+    // boundary: it is constructed by the Qt host (LogosAPIProvider) and reached
+    // only through QMetaObject dispatch or, from a module cdylib, not at all —
+    // the type that crosses is the LogosProviderObject vtable, which is
+    // untouched.
+    TokenManager* m_store;
     TokenValidator m_validator;
 };
 

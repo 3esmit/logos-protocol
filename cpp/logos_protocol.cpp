@@ -24,6 +24,7 @@
 #include <QVariant>
 #include <QVariantList>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -137,12 +138,27 @@ bool parseArgs(const char* args_json, const QString& origin,
 
 } // namespace
 
+// Everything the status/generation surface needs, per CLIENT — which is per
+// TARGET MODULE, since an lp_client names exactly one. Held by shared_ptr and
+// captured by the registry trampoline rather than referenced through `client`,
+// because that callback can still be in flight when lp_client_destroy runs.
+struct LpClientSubState {
+    // Mirror of the registry's per-target generation, so
+    // lp_client_subscription_generation() is a lock-free read from any thread
+    // instead of a blocking marshal onto the owner thread.
+    std::atomic<unsigned long long> generation{0};
+    std::mutex cbMu;
+    lp_subscription_status_cb cb = nullptr;
+    void* userData = nullptr;
+};
+
 struct lp_client {
     LogosAPIClient* client = nullptr;
     QString target;
     QString targetInstanceId;
     QString origin;
     std::shared_ptr<CbGuard> guard;
+    std::shared_ptr<LpClientSubState> subState = std::make_shared<LpClientSubState>();
 };
 
 struct lp_subscription {
@@ -164,78 +180,6 @@ struct lp_provider {
     lp_token_cb onToken = nullptr;
     void* userData = nullptr;
 };
-
-namespace {
-
-lp_client* createClient(const char* target_module,
-                        const char* target_instance_id,
-                        const char* origin_module,
-                        const char* target_transport_json,
-                        const char* capability_transport_json)
-{
-    if (!target_module || !*target_module || !origin_module) return nullptr;
-
-    LogosTransportConfig targetCfg;
-    LogosTransportConfig capabilityCfg;
-    if (!parseTransportJson(target_transport_json, targetCfg)) return nullptr;
-    if (!parseTransportJson(capability_transport_json, capabilityCfg)) return nullptr;
-
-    // Same registration LogosAPI's constructor performs — lp-only consumers
-    // never construct a LogosAPI, so do it here (idempotent).
-    qRegisterMetaType<LogosResult>("LogosResult");
-
-    auto* handle = new lp_client();
-    handle->target = QString::fromUtf8(target_module);
-    handle->targetInstanceId = target_instance_id
-        ? QString::fromUtf8(target_instance_id)
-        : QString{};
-    handle->origin = QString::fromUtf8(origin_module);
-    handle->guard = std::make_shared<CbGuard>();
-
-    // No QObject parent: the handle owns the client.
-    //
-    // Construction picks the owner thread every later call marshals onto
-    // (logos::runOnOwnerThread), and for a Qt-affine transport it also picks
-    // the thread that owns the QRemoteObjectNode and its QLocalSocket. Those
-    // only work on a thread running a Qt event loop, so we construct on the Qt
-    // main thread rather than on whichever thread happened to call first.
-    //
-    // Callers reach lp_client_create through a lazily-created wrapper (the
-    // generated bind_<iface>() → LpClient::ensure()), so "whichever thread
-    // called first" is genuinely arbitrary: a module whose first outbound call
-    // comes from an HTTP handler used to bind its whole transport to that
-    // worker thread. The worker only pumps events while blocked inside a call,
-    // so replica acquisition never completed and every call burned its full
-    // 20s timeout — silently, since a failed acquire returns an empty result.
-    // The Qt path never had this: LogosAPI::getClient marshals construction to
-    // the LogosAPI's thread, which is the main thread. This gives the lp path
-    // the same anchor.
-    //
-    // Plain (Tcp/TcpSsl) and mock transports are Qt-free and thread-agnostic —
-    // they keep the calling thread, so a worker-thread consumer stays off the
-    // main thread's back.
-    const bool qtAffine = LogosTransportFactory::needsQtEventLoop(targetCfg)
-                       || LogosTransportFactory::needsQtEventLoop(capabilityCfg);
-    auto construct = [&]() -> LogosAPIClient* {
-        return new LogosAPIClient(handle->target, handle->origin,
-                                  &TokenManager::forIdentity(handle->origin),
-                                  targetCfg, capabilityCfg,
-                                  handle->targetInstanceId);
-    };
-    if (qtAffine && !QCoreApplication::instance()) {
-        // Nothing to anchor to. The transport will misbehave for the reasons
-        // above; say so once rather than let it surface as a mute timeout.
-        qWarning() << "lp_client_create: creating a Qt-affine client for"
-                   << handle->target
-                   << "with no QCoreApplication — the QtRO transport needs a "
-                      "Qt event loop; use a plain (tcp) transport in Qt-free "
-                      "hosts";
-    }
-    handle->client = qtAffine ? logos::runOnQtMainThread(construct) : construct();
-    return handle;
-}
-
-} // namespace
 
 extern "C" {
 
@@ -295,6 +239,88 @@ int lp_set_default_transport(const char* transport_json)
 }
 
 /* ---------------------------------------------------------------- clients */
+
+// Defined with the rest of the per-target subscription surface, below.
+static void lpInstallStatusTrampoline(lp_client* handle);
+
+static lp_client* createClient(const char* target_module,
+                               const char* target_instance_id,
+                               const char* origin_module,
+                               const char* target_transport_json,
+                               const char* capability_transport_json)
+{
+    if (!target_module || !*target_module || !origin_module) return nullptr;
+
+    LogosTransportConfig targetCfg;
+    LogosTransportConfig capabilityCfg;
+    if (!parseTransportJson(target_transport_json, targetCfg)) return nullptr;
+    if (!parseTransportJson(capability_transport_json, capabilityCfg)) return nullptr;
+
+    // Same registration LogosAPI's constructor performs — lp-only consumers
+    // never construct a LogosAPI, so do it here (idempotent).
+    qRegisterMetaType<LogosResult>("LogosResult");
+
+    auto* handle = new lp_client();
+    handle->target = QString::fromUtf8(target_module);
+    handle->targetInstanceId = target_instance_id
+        ? QString::fromUtf8(target_instance_id)
+        : QString{};
+    handle->origin = QString::fromUtf8(origin_module);
+    handle->guard = std::make_shared<CbGuard>();
+
+    // No QObject parent: the handle owns the client.
+    //
+    // Construction picks the owner thread every later call marshals onto
+    // (logos::runOnOwnerThread), and for a Qt-affine transport it also picks
+    // the thread that owns the QRemoteObjectNode and its QLocalSocket. Those
+    // only work on a thread running a Qt event loop, so we construct on the Qt
+    // main thread rather than on whichever thread happened to call first.
+    //
+    // Callers reach lp_client_create through a lazily-created wrapper (the
+    // generated bind_<iface>() → LpClient::ensure()), so "whichever thread
+    // called first" is genuinely arbitrary: a module whose first outbound call
+    // comes from an HTTP handler used to bind its whole transport to that
+    // worker thread. The worker only pumps events while blocked inside a call,
+    // so replica acquisition never completed and every call burned its full
+    // 20s timeout — silently, since a failed acquire returns an empty result.
+    // The Qt path never had this: LogosAPI::getClient marshals construction to
+    // the LogosAPI's thread, which is the main thread. This gives the lp path
+    // the same anchor.
+    //
+    // Plain (Tcp/TcpSsl) and mock transports are Qt-free and thread-agnostic —
+    // they keep the calling thread, so a worker-thread consumer stays off the
+    // main thread's back.
+    const bool qtAffine = LogosTransportFactory::needsQtEventLoop(targetCfg)
+                       || LogosTransportFactory::needsQtEventLoop(capabilityCfg);
+    // forIdentity(origin), not instance(). This is the whole answer to the
+    // frozen lp_client_create signature: the store cannot be HANDED to this
+    // function, so the origin the caller already declares has to select it.
+    // Identical to instance() — the same object — unless the host isolated this
+    // origin, so no existing binding changes behaviour.
+    auto construct = [&]() -> LogosAPIClient* {
+        return new LogosAPIClient(handle->target, handle->origin,
+                                  &TokenManager::forIdentity(handle->origin),
+                                  targetCfg, capabilityCfg,
+                                  handle->targetInstanceId);
+    };
+    if (qtAffine && !QCoreApplication::instance()) {
+        // Nothing to anchor to. The transport will misbehave for the reasons
+        // above; say so once rather than let it surface as a mute timeout.
+        qWarning() << "lp_client_create: creating a Qt-affine client for"
+                   << handle->target
+                   << "with no QCoreApplication — the QtRO transport needs a "
+                      "Qt event loop; use a plain (tcp) transport in Qt-free "
+                      "hosts";
+    }
+    handle->client = qtAffine ? logos::runOnQtMainThread(construct) : construct();
+
+    // Unconditionally, before the caller can subscribe to anything: the
+    // generation mirror is the half of the continuity surface that is NOT
+    // opt-in, so a plain lp_subscribe caller that never installs a status
+    // callback still gets a counter it can poll for gap detection.
+    lpInstallStatusTrampoline(handle);
+    return handle;
+}
 
 lp_client* lp_client_create(const char* target_module,
                             const char* origin_module,
@@ -510,6 +536,134 @@ lp_subscription* lp_subscribe(lp_client* client,
     return sub;
 }
 
+/* --------------------------------------------- per-target subscription state */
+
+// Install the ONE registry watcher this client needs, at creation, whether or
+// not the caller ever asks for a status callback: the generation mirror is the
+// half of this feature that is not opt-in, and a plain lp_subscribe caller
+// polling lp_client_subscription_generation() has to see arms it never
+// subscribed to hear about.
+//
+// Captures the shared state and guard, never `client` — the callback can still
+// be in flight when lp_client_destroy runs.
+static void lpInstallStatusTrampoline(lp_client* handle)
+{
+    auto st = handle->subState;
+    auto guard = handle->guard;
+    handle->client->setSubscriptionStatusCallback(
+        handle->target,
+        [st, guard](LogosSubscriptionEvent ev, quint64 generation, const QString& reason) {
+            // Record before any liveness gate: the counter is read by callers
+            // that never installed a status_cb, and a destroyed client's
+            // counter is simply never read again.
+            if (ev == LogosSubscriptionEvent::Armed)
+                st->generation.store(generation, std::memory_order_release);
+
+            lp_subscription_status_cb cb = nullptr;
+            void* userData = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(st->cbMu);
+                cb = st->cb;
+                userData = st->userData;
+            }
+            if (!cb) return;
+
+            std::lock_guard<std::recursive_mutex> clientLock(guard->mutex);
+            if (!guard->alive) return;
+
+            // No default: on purpose. -Wswitch then makes a new
+            // LogosSubscriptionEvent a COMPILE error here rather than a silent
+            // fall-through to ARMED, which is exactly what adding Held did
+            // before this case existed — the registry held the subscription
+            // correctly and the C ABI reported it as armed.
+            int state = LP_SUB_ARMED;
+            switch (ev) {
+                case LogosSubscriptionEvent::Armed:     state = LP_SUB_ARMED;     break;
+                case LogosSubscriptionEvent::Lost:      state = LP_SUB_LOST;      break;
+                case LogosSubscriptionEvent::Abandoned: state = LP_SUB_ABANDONED; break;
+                case LogosSubscriptionEvent::Held:      state = LP_SUB_HELD;      break;
+            }
+            const QByteArray reasonUtf8 = reason.toUtf8();
+            cb(state, static_cast<unsigned long long>(generation),
+               reason.isEmpty() ? nullptr : reasonUtf8.constData(), userData);
+        });
+}
+
+int lp_client_set_subscription_status_cb(lp_client* client,
+                                         lp_subscription_status_cb status_cb,
+                                         void* user_data)
+{
+    if (!client || !client->client) return 0;
+    {
+        std::lock_guard<std::mutex> lk(client->subState->cbMu);
+        client->subState->cb = status_cb;
+        client->subState->userData = user_data;
+    }
+    // Re-install so the registry replays the CURRENT state into the callback
+    // that was just set — a consumer that subscribes first and installs its
+    // watcher afterwards would otherwise never hear about the arm that already
+    // happened. Re-installing replaces the trampoline with an identical one.
+    if (status_cb) lpInstallStatusTrampoline(client);
+    return 1;
+}
+
+unsigned long long lp_client_subscription_generation(lp_client* client)
+{
+    return client ? client->subState->generation.load(std::memory_order_acquire) : 0;
+}
+
+int lp_client_set_subscription_options(lp_client* client, const char* options_json)
+{
+    if (!client || !client->client) return 0;
+
+    // Unknown keys and an unparseable document both fall back to the defaults
+    // rather than failing: a newer caller against an older runtime should lose
+    // the OPTION, not its subscriptions.
+    LogosRestartPolicy restart = LogosRestartPolicy::Automatic;
+    if (options_json && *options_json) {
+        auto opts = nlohmann::json::parse(options_json, nullptr, /*allow_exceptions=*/false);
+        if (opts.is_discarded()) {
+            qWarning("lp_client_set_subscription_options: options_json is not valid JSON");
+            return 0;
+        }
+        if (opts.is_object() && opts.contains("restart") && opts["restart"].is_string()) {
+            const std::string r = opts["restart"].get<std::string>();
+            if (r == "manual") restart = LogosRestartPolicy::Manual;
+            else if (r != "automatic")
+                qWarning("lp_client_set_subscription_options: unknown restart '%s'; using automatic",
+                         r.c_str());
+        }
+    }
+    client->client->setSubscriptionRestartPolicy(client->target, restart);
+    return 1;
+}
+
+int lp_client_rearm_subscriptions(lp_client* client)
+{
+    if (!client || !client->client || !client->guard) return 0;
+
+    // POSTED, exactly as lp_unsubscribe's de-tracking half is, and for the same
+    // reason: the natural place to call this from is INSIDE the status callback,
+    // which runs on the owner thread holding this client's guard. Marshalling
+    // synchronously from there would re-enter that guard, and would hang
+    // outright once the owner's event loop has stopped.
+    //
+    // The cost is that the answer is "accepted", not "done": 1 means the revive
+    // was queued against a live client, not that anything has re-armed. The ARM
+    // itself is what the caller should watch for, and it already has a signal
+    // for that — LP_SUB_ARMED with a higher generation.
+    auto ownerGuard = client->guard;
+    LogosAPIClient* owner = client->client;
+    const QString target = client->target;
+    std::lock_guard<std::recursive_mutex> ownerLock(ownerGuard->mutex);
+    if (!ownerGuard->alive) return 0;
+    QMetaObject::invokeMethod(owner, [ownerGuard, owner, target]() {
+        std::lock_guard<std::recursive_mutex> lock(ownerGuard->mutex);
+        if (ownerGuard->alive) owner->rearmSubscriptions(target);
+    }, Qt::QueuedConnection);
+    return 1;
+}
+
 void lp_unsubscribe(lp_subscription* sub)
 {
     if (!sub) return;
@@ -613,8 +767,57 @@ char* lp_token_get(const char* module_name)
 int lp_token_save(const char* module_name, const char* token)
 {
     if (!module_name || !token) return LP_ERR_INVALID_ARG;
-    TokenManager::instance().saveToken(QString::fromUtf8(module_name),
-                                       QString::fromUtf8(token));
+    const QString key = QString::fromUtf8(module_name);
+    // SYMMETRIC WITH lp_token_save_inbound, deliberately. saveToken() refuses a
+    // key carrying the reserved direction namespace and can only say so in the
+    // log: its signature is void and is pinned by the cross-package ABI freeze
+    // (see the layout note in token_manager.h), so it cannot report through a
+    // return value. Without this the two doors disagreed about the SAME
+    // refusal — LP_OK here, LP_ERR_INVALID_ARG there — and a module tripping
+    // the guard read rc=0 and carried on believing it held a credential it does
+    // not hold. Asked FIRST, so the answer cannot depend on saveToken's
+    // internals staying in step.
+    if (TokenManager::isReservedKey(key)) return LP_ERR_INVALID_ARG;
+    TokenManager::instance().saveToken(key, QString::fromUtf8(token));
+    return LP_OK;
+}
+
+int lp_token_save_inbound(const char* caller, const char* token)
+{
+    if (!caller || !token) return LP_ERR_INVALID_ARG;
+    const QString callerName = QString::fromUtf8(caller);
+    const QString value      = QString::fromUtf8(token);
+
+    // The inbound half, always. saveInboundToken refuses an empty name, an
+    // empty token, and a name carrying the reserved direction namespace --
+    // `caller` is named by capability_module over RPC, so it must not be able to
+    // address any key but its own.
+    if (!TokenManager::instance().saveInboundToken(callerName, value))
+        return LP_ERR_INVALID_ARG;
+
+    // THE TOKEN-REGISTRY CARVE-OUT. See the declaration for the argument; the
+    // short version is that informModuleToken means opposite things depending on
+    // WHO RECEIVES IT. To an ordinary provider it is "this caller may call you"
+    // and stops at the line above. To the module holding the registry it is
+    // "here is module X's token, present it when you call X", and that is
+    // outbound: capability_module reads lp_token_keys() for its known-caller
+    // gate and lp_token_get() for the credential it presents when pushing to the
+    // target. Both read the OUTBOUND half.
+    //
+    // The grant is the declaration of that role, so the grant decides. It is off
+    // by default, fail-closed, already the gate on lp_token_keys, and it lives
+    // in the image whose store is being written -- unlike a codegen flag, which
+    // would be a second place for the two to disagree and which the glue
+    // generator could not compute anyway (it is handed a LIDL contract, not
+    // metadata.json).
+    //
+    // MEASURED CONSEQUENCE OF OMITTING THIS, so nobody "simplifies" it away:
+    // capability_module's roster empties, every requestModule is refused with
+    // "rejecting request from unknown module identity", and the fleet locks out
+    // at the first cross-module call. Fail-closed, and total.
+    if (hostServiceGranted(ServiceTokenRegistry))
+        TokenManager::instance().saveToken(callerName, value);
+
     return LP_OK;
 }
 
@@ -659,8 +862,15 @@ int lp_token_save_for(const char* identity, const char* module_name,
                       const char* token)
 {
     if (!identity || !module_name || !token) return LP_ERR_INVALID_ARG;
+    const QString key = QString::fromUtf8(module_name);
+    // The same door with a store selector in front of it, so it owes the same
+    // answer — see lp_token_save. Checked BEFORE forIdentity(), which is not
+    // tidiness: forIdentity() records that a shared store was vended under
+    // `identity`, and that record makes a later isolateIdentity() refuse. A
+    // rejected argument must not be able to cost an identity its isolation.
+    if (TokenManager::isReservedKey(key)) return LP_ERR_INVALID_ARG;
     TokenManager::forIdentity(QString::fromUtf8(identity))
-        .saveToken(QString::fromUtf8(module_name), QString::fromUtf8(token));
+        .saveToken(key, QString::fromUtf8(token));
     return LP_OK;
 }
 
@@ -672,6 +882,20 @@ int lp_token_reset_identity(const char* identity)
     // ambient ring would take every other identity's tokens with it), and a
     // silent success would read as "the store is empty now".
     return TokenManager::resetIdentity(QString::fromUtf8(identity))
+        ? LP_OK
+        : LP_ERR_UNSUPPORTED;
+}
+
+int lp_token_adopt_credential(const char* identity, const char* credential)
+{
+    if (!identity || !*identity || !credential || !*credential)
+        return LP_ERR_INVALID_ARG;
+    // LP_ERR_UNSUPPORTED covers both refusals TokenManager makes — a
+    // non-isolated identity and a credential equal to this image's host anchor
+    // — because both mean the same thing to a caller: nothing was written and
+    // retrying with the same arguments will not change that.
+    return TokenManager::adoptCredentialFor(QString::fromUtf8(identity),
+                                            QString::fromUtf8(credential))
         ? LP_OK
         : LP_ERR_UNSUPPORTED;
 }
