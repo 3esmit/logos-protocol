@@ -1109,10 +1109,6 @@ QVariant LogosAPIConsumer::invokeRemoteMethod(const QString& authToken, const QS
     } else {
         result = plugin->callMethod(authToken, methodName, args, timeout.ms);
     }
-
-    // Providers can reject a call with a sentinel result even when the
-    // transport itself completed successfully. Preserve that provider-level
-    // diagnosis across both error-channel and legacy transports.
     QString providerMessage;
     if (logos::isProviderFailureSentinel(result, &providerMessage)) {
         if (err) {

@@ -20,23 +20,6 @@
 using logos::qvariantToNlohmann;
 using logos::nlohmannArgsToQVariantList;
 
-namespace logos {
-
-QString scopedModuleTokenKey(const QString& moduleName,
-                             const QString& instanceId)
-{
-    // Delimiters alone would allow ambiguous pairs such as ("a:b", "c") and
-    // ("a", "b:c"). Prefix each untrusted segment with its UTF-16 length so
-    // this private TokenManager key remains injective.
-    return QStringLiteral("logos.instance-token.v1/%1:%2/%3:%4")
-        .arg(moduleName.size())
-        .arg(moduleName)
-        .arg(instanceId.size())
-        .arg(instanceId);
-}
-
-} // namespace logos
-
 namespace {
 
 // The store this client presents tokens from.
@@ -56,6 +39,23 @@ TokenManager* storeFor(TokenManager* explicit_store, const QString& origin_modul
 }
 
 } // namespace
+
+namespace logos {
+
+QString scopedModuleTokenKey(const QString& moduleName,
+                             const QString& instanceId)
+{
+    // Delimiters alone would allow ambiguous pairs such as ("a:b", "c") and
+    // ("a", "b:c"). Prefix each untrusted segment with its UTF-16 length so
+    // this private TokenManager key remains injective.
+    return QStringLiteral("logos.instance-token.v1/%1:%2/%3:%4")
+        .arg(moduleName.size())
+        .arg(moduleName)
+        .arg(instanceId.size())
+        .arg(instanceId);
+}
+
+} // namespace logos
 
 LogosAPIClient::LogosAPIClient(const QString& module_to_talk_to,
                                const QString& origin_module,
@@ -78,8 +78,7 @@ LogosAPIClient::LogosAPIClient(const QString& module_to_talk_to,
     : QObject(parent)
     , m_consumer(new LogosAPIConsumer(module_to_talk_to, origin_module,
                                       storeFor(token_manager, origin_module),
-                                      target_transport,
-                                      target_instance_id, this))
+                                      target_transport, target_instance_id, this))
     , m_token_manager(storeFor(token_manager, origin_module))
     , m_origin_module(origin_module)
     // Pre-build the capability_module consumer once. We skip it for
@@ -254,7 +253,6 @@ QString LogosAPIClient::mintAndCacheToken(const QString& objectName, Timeout tim
                               : QStringLiteral("requestModule"))
              << "for" << objectName;
     const QString capabilityToken = getToken(QStringLiteral("capability_module"));
-
     // A NAMED DIAGNOSTIC for the one way this whole path fails silently.
     //
     // A private token store is created empty; the host is what puts the
@@ -292,8 +290,7 @@ QString LogosAPIClient::mintAndCacheToken(const QString& objectName, Timeout tim
         token = QString::fromStdString(
             m_capability_consumer->requestModule(capabilityToken.toStdString(),
                                                  m_origin_module.toStdString(),
-                                                 objectName.toStdString(),
-                                                 timeout.ms));
+                                                 objectName.toStdString(), timeout.ms));
     }
     qDebug() << "LogosAPIClient: requestModule result for" << objectName << ":" << redactToken(token);
     // Cache the minted token so subsequent calls skip the handshake — closes the
@@ -547,7 +544,8 @@ void LogosAPIClient::finishReadiness(const QString& objectName)
 void LogosAPIClient::drainPendingHandshakes(const QString& objectName,
                                             const QString& token, bool targetReachable)
 {
-    auto it = m_pendingHandshakes.find(tokenKeyFor(objectName));
+    const QString tokenKey = tokenKeyFor(objectName);
+    auto it = m_pendingHandshakes.find(tokenKey);
     if (it == m_pendingHandshakes.end()) return;
     auto calls = std::move(it.value());
     m_pendingHandshakes.erase(it);                    // erase BEFORE running: a
@@ -556,11 +554,18 @@ void LogosAPIClient::drainPendingHandshakes(const QString& objectName,
 
 void LogosAPIClient::startCapabilityHandshake(const QString& objectName, Timeout timeout)
 {
+    const QString capabilityToken = getToken("capability_module");
+    const QString origin = m_origin_module;
     const QString tokenKey = tokenKeyFor(objectName);
     const bool scopedTarget = !m_target_instance_id.isEmpty()
         && objectName != QStringLiteral("capability_module");
-    const QString capabilityToken = getToken("capability_module");
-    const QString origin = m_origin_module;
+    const QString capabilityMethod = scopedTarget
+        ? QStringLiteral("requestModuleScoped")
+        : QStringLiteral("requestModule");
+    QVariantList capabilityArgs;
+    capabilityArgs << origin << objectName;
+    if (scopedTarget)
+        capabilityArgs << m_target_instance_id;
     // Lifetime: capture the client through a QPointer guard. If it (and its
     // QObject-parented consumers + the pending queue) is destroyed while the
     // requestModule round-trip is in flight, the guard goes null and we drop
@@ -569,10 +574,8 @@ void LogosAPIClient::startCapabilityHandshake(const QString& objectName, Timeout
     m_capability_consumer->invokeRemoteMethodAsync(
         capabilityToken,
         QStringLiteral("capability_module"),
-        scopedTarget ? QStringLiteral("requestModuleScoped")
-                     : QStringLiteral("requestModule"),
-        scopedTarget ? (QVariantList() << origin << objectName << m_target_instance_id)
-                     : (QVariantList() << origin << objectName),
+        capabilityMethod,
+        capabilityArgs,
         [self, objectName, tokenKey](const QVariant& tokenResult) mutable {
             if (!self) return;  // client destroyed mid-flight
             const QString tok = tokenResult.toString();

@@ -410,9 +410,13 @@ int lp_invoke(lp_client* client,
         if (out_error_json)
             *out_error_json = lpStrdup(makeErrorJson(
                 callErr.code.c_str(), callErr.message, callErr.origin));
-        return callErr.code == "object_unavailable"
-                   || callErr.code == "timeout"
-                   || callErr.code == "transport_error"
+        // A deadline or transport loss is an availability failure from the C
+        // ABI's perspective. Keep provider-side invocation failures distinct
+        // (`LP_ERR_INTERNAL`) while retaining the unavailable result code for
+        // acquisition and call-path failures.
+        return (callErr.code == "object_unavailable"
+                || callErr.code == "timeout"
+                || callErr.code == "transport_error")
             ? LP_ERR_UNAVAILABLE
             : LP_ERR_INTERNAL;
     }
