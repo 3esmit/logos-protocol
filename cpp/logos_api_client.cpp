@@ -221,8 +221,6 @@ QVariant LogosAPIClient::invokeRemoteMethod(const QString& objectName, const QSt
     if (eligible && logos::isUnauthorizedSentinel(result)) {
         qWarning() << "LogosAPIClient: token for" << objectName
                    << "rejected by provider; re-exchanging and retrying once";
-        m_token_manager->removeToken(objectName);
-        const QString fresh = mintAndCacheToken(objectName, timeout);
         m_token_manager->removeToken(tokenKey);
         const QString fresh = mintAndCacheToken(objectName, timeout);
         if (!fresh.isEmpty())
