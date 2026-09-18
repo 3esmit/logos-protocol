@@ -500,8 +500,7 @@ private:
     // distinct tokens overwrite each other on the target — so already-dispatched
     // calls carry a superseded token and get rejected. Touched only on the
     // owner thread (invokeRemoteMethodAsync marshals there), so it needs no
-    // lock. Appended after the pre-existing ABI-sensitive layout; defaults to
-    // empty.
+    // lock. Appended last per the ABI note above; defaults to empty.
     // The bool is "the target is reachable". The queue is drained by exactly ONE of three
     // edges — ready, deadline, or client destroyed — and never twice.
     QMap<QString, std::vector<std::function<void(const QString&, bool)>>> m_pendingHandshakes;
